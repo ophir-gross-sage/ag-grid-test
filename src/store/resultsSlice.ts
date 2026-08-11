@@ -1,5 +1,5 @@
 import { createSlice, type PayloadAction } from '@reduxjs/toolkit';
-import { RESULT_SIZE, type Result } from '../types';
+import { INPUT_RESULT_COLUMNS, RESULT_SIZE, type Result } from '../types';
 import { DATASET } from './dataset';
 
 /**
@@ -83,16 +83,34 @@ const resultsSlice = createSlice({
       },
       prepare: (row: number, value: number[]) => ({ payload: { row, value } }),
     },
+
+    /**
+     * Replace only the input slots (R1-R9), leaving the computed slots alone.
+     *
+     * This is what bulk mutation should use. Writing all 12 would put arbitrary
+     * numbers in R10-R12 for the frame or two before the engine overwrites
+     * them, which reads as the grid briefly displaying wrong answers.
+     */
+    setResultInputs: {
+      reducer(state, action: PayloadAction<SetResultValuePayload>) {
+        const { row, value } = action.payload;
+        const base = row * RESULT_SIZE;
+        for (let i = 0; i < INPUT_RESULT_COLUMNS; i++) state.values[base + i] = value[i];
+        state.revision++;
+      },
+      prepare: (row: number, value: number[]) => ({ payload: { row, value } }),
+    },
   },
 });
 
-export const { setResultCell, setResultValue } = resultsSlice.actions;
+export const { setResultCell, setResultValue, setResultInputs } = resultsSlice.actions;
 export const resultsReducer = resultsSlice.reducer;
 
 /** Action types the grid-sync middleware watches. */
 export const RESULT_MUTATION_TYPES: ReadonlySet<string> = new Set([
   setResultCell.type,
   setResultValue.type,
+  setResultInputs.type,
 ]);
 
 // --- Reads ------------------------------------------------------------------

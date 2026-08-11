@@ -11,7 +11,7 @@ import {
   type ValueSetterParams,
 } from 'ag-grid-community';
 
-import { RESULT_SIZE } from '../types';
+import { INPUT_RESULT_COLUMNS, RESULT_SIZE, isComputedResultColumn } from '../types';
 import { useAppStore } from '../store/hooks';
 import { readAspect, readExtra, readResult } from '../store/selectors';
 import { setResultCell } from '../store/resultsSlice';
@@ -35,6 +35,21 @@ export const RESULT_COLUMN_IDS: string[] = Array.from(
   { length: RESULT_SIZE },
   (_, col) => `result-${col}`,
 );
+
+/** R10-R12 — the calculation's output. */
+export const COMPUTED_COLUMN_IDS: string[] = RESULT_COLUMN_IDS.filter((_, col) =>
+  isComputedResultColumn(col),
+);
+
+/** What each computed column means, for its header tooltip. */
+const COMPUTED_COLUMN_HELP: Record<number, string> = {
+  [INPUT_RESULT_COLUMNS]:
+    'Composite — R1-R9 normalised against population baselines. Computed; depends on every row.',
+  [INPUT_RESULT_COLUMNS + 1]:
+    'Dispersion — spread of R1-R9 around their own mean. Computed; depends on this row only.',
+  [INPUT_RESULT_COLUMNS + 2]:
+    'Percentile — rank of this row’s composite among all 50,000. Computed; depends on every row.',
+};
 const ASPECT_COLUMN_PREFIX = 'aspect-col-';
 const EXTRA_COLUMN_ID = 'extraData';
 
@@ -76,15 +91,29 @@ export function EntityGrid({ onGridReady }: EntityGridProps) {
         p.data ? readAspect(store.getState(), p.data.row, poolIndex) : undefined,
     }));
 
-    const resultColumns: ColDef<GridRow>[] = RESULT_COLUMN_IDS.map((colId, col) => ({
+    const resultColumns: ColDef<GridRow>[] = RESULT_COLUMN_IDS.map((colId, col) => {
+      const computed = isComputedResultColumn(col);
+      return {
       colId,
-      headerName: `R${col + 1}`,
-      width: 86,
-      editable: true,
+      headerName: computed ? `R${col + 1} ƒ` : `R${col + 1}`,
+      headerTooltip: computed ? COMPUTED_COLUMN_HELP[col] : undefined,
+      headerClass: computed ? 'computed-header' : undefined,
+      cellClass: computed ? 'computed-cell' : undefined,
+      width: computed ? 96 : 86,
+      /**
+       * Computed columns are outputs, not inputs. Making them editable would
+       * let a user type a value that the next calculation silently overwrites —
+       * the edit appears to work and then vanishes, which is worse than not
+       * offering it.
+       */
+      editable: !computed,
       cellDataType: 'number',
       type: 'numericColumn',
       valueGetter: (p: ValueGetterParams<GridRow>) =>
         p.data ? readResult(store.getState(), p.data.row, col) : undefined,
+      valueFormatter: computed
+        ? (p) => (typeof p.value === 'number' ? p.value.toFixed(2) : '')
+        : undefined,
 
       /**
        * The write path for an inline edit. Redux is the only place the value
@@ -104,7 +133,8 @@ export function EntityGrid({ onGridReady }: EntityGridProps) {
         // the gridSync batch repaints anything else the change implied.
         return true;
       },
-    }));
+      };
+    });
 
     return [extraColumn, ...aspectColumns, ...resultColumns];
   }, [store]);
@@ -147,6 +177,23 @@ export function EntityGrid({ onGridReady }: EntityGridProps) {
       store.getState().aspects.ids.map((_, i) => `${ASPECT_COLUMN_PREFIX}${i}`),
     );
     refresh(batch.extraRows, [EXTRA_COLUMN_ID]);
+
+    /**
+     * Bulk path: too many rows changed to be worth naming individually, so
+     * refresh every rendered cell of that family instead. Omitting `rowNodes`
+     * means "all rendered rows" — around 30, whatever the change count was.
+     */
+    if (batch.bulk.has('result')) {
+      touched += 1;
+      api.refreshCells({ columns: RESULT_COLUMN_IDS, force: true });
+      /**
+       * Flash only the computed columns, not the whole viewport. A full
+       * recalculation can change every row on screen; strobing all 18 columns
+       * would say "everything moved" when the informative signal is narrower —
+       * these three are what the calculation actually rewrote.
+       */
+      api.flashCells({ columns: COMPUTED_COLUMN_IDS });
+    }
 
     if (touched > 0) completeTask(performance.now() - startedAt);
   }, [store]);

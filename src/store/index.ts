@@ -4,7 +4,9 @@ import { aspectsReducer } from './aspectsSlice';
 import { mainEntitiesReducer } from './mainEntitiesSlice';
 import { resultsReducer } from './resultsSlice';
 import { extraDataReducer } from './extraDataSlice';
+import { calcReducer } from './calcSlice';
 import { gridSyncMiddleware } from './gridSync';
+import { calcMiddleware } from '../calc/calcMiddleware';
 
 /**
  * Immer deep-freezes produced state in development. On slices holding 50,000-
@@ -19,6 +21,7 @@ export const store = configureStore({
     mainEntities: mainEntitiesReducer,
     results: resultsReducer,
     extraData: extraDataReducer,
+    calc: calcReducer,
   },
   middleware: (getDefaultMiddleware) =>
     getDefaultMiddleware({
@@ -31,7 +34,12 @@ export const store = configureStore({
        */
       serializableCheck: false,
       immutableCheck: false,
-    }).concat(gridSyncMiddleware),
+      /**
+       * `calcMiddleware` reads the pre-reducer value to compute deltas, so it
+       * must sit ahead of `gridSyncMiddleware` — which only forwards, and is
+       * happy anywhere.
+       */
+    }).concat(calcMiddleware, gridSyncMiddleware),
 
   /**
    * DevTools serialises a snapshot of state per action. A 50,000-row snapshot

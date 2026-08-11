@@ -205,6 +205,97 @@ button.link {
   font-size: 12.5px;
 }
 
+/* --- calculation panel --- */
+
+.calc-panel {
+  display: flex;
+  align-items: center;
+  gap: 20px;
+  flex-wrap: wrap;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 8px 12px;
+}
+
+.calc-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.calc-status {
+  font-size: 13px;
+  font-weight: 550;
+}
+
+button.small {
+  padding: 4px 10px;
+  font-size: 12px;
+}
+
+.calc-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  flex: none;
+  background: var(--muted);
+}
+
+.calc-dot.calc-idle {
+  background: var(--good);
+}
+
+.calc-dot.calc-scheduled {
+  background: var(--accent);
+}
+
+.calc-dot.calc-calculating {
+  background: var(--accent);
+  animation: calc-pulse 0.7s ease-in-out infinite;
+}
+
+.calc-dot.calc-stale {
+  background: var(--bad);
+}
+
+@keyframes calc-pulse {
+  50% {
+    opacity: 0.25;
+  }
+}
+
+.calc-stats {
+  display: flex;
+  gap: 20px;
+  flex-wrap: wrap;
+  margin: 0;
+}
+
+.calc-stats dt {
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.calc-stats dd {
+  margin: 0;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12.5px;
+}
+
+.calc-stats dd.good {
+  color: var(--good);
+}
+
+.calc-stats dd.bad {
+  color: var(--bad);
+}
+
+.calc-sub {
+  color: var(--muted);
+  font-family: inherit;
+}
+
 /* --- grid --- */
 
 .grid-shell {
@@ -227,4 +318,21 @@ button.link {
 
 .ag-cell.ag-cell-data-changed-animation {
   transition: background-color 0.45s ease-out;
+}
+
+/*
+ * Computed columns (R10-R12). Tinted and italicised so it is obvious at a
+ * glance which numbers the user owns and which the engine does — the columns
+ * are also not editable, and a visual difference is what makes that read as
+ * intentional rather than broken.
+ */
+.ag-cell.computed-cell {
+  background-color: rgba(110, 168, 254, 0.07);
+  font-style: italic;
+  color: #cfd8e8;
+}
+
+.ag-header-cell.computed-header {
+  background-color: rgba(110, 168, 254, 0.1);
+  color: var(--accent);
 }

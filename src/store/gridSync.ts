@@ -18,16 +18,33 @@ import { EXTRA_DATA_MUTATION_TYPES } from './extraDataSlice';
  * per action.
  */
 
+/** Column families the grid can refresh independently. */
+export type ChangeKind = 'result' | 'aspect' | 'extra' | 'derived';
+
 export interface GridChangeBatch {
-  /** Rows whose result values changed. */
   resultRows: ReadonlySet<number>;
-  /** Rows whose aspect values changed. */
   aspectRows: ReadonlySet<number>;
-  /** Rows whose extra-data value changed. */
   extraRows: ReadonlySet<number>;
+  derivedRows: ReadonlySet<number>;
+  /**
+   * Families where so many rows changed that enumerating them costs more than
+   * refreshing every visible cell of that family. See `BULK_THRESHOLD`.
+   */
+  bulk: ReadonlySet<ChangeKind>;
 }
 
 type Listener = (batch: GridChangeBatch) => void;
+
+/**
+ * Above this many changed rows, stop tracking individual rows and refresh the
+ * whole viewport for that family instead.
+ *
+ * A full recalculation can change tens of thousands of rows. Adding 50,000
+ * entries to a Set and then looking up 50,000 row nodes costs several
+ * milliseconds, to produce a refresh of the ~30 rows that are actually on
+ * screen. Past this point the bulk path is both cheaper and visually identical.
+ */
+const BULK_THRESHOLD = 256;
 
 const listeners = new Set<Listener>();
 
@@ -35,7 +52,9 @@ const listeners = new Set<Listener>();
 const resultRows = new Set<number>();
 const aspectRows = new Set<number>();
 const extraRows = new Set<number>();
-const batch: GridChangeBatch = { resultRows, aspectRows, extraRows };
+const derivedRows = new Set<number>();
+const bulk = new Set<ChangeKind>();
+const batch: GridChangeBatch = { resultRows, aspectRows, extraRows, derivedRows, bulk };
 
 let scheduled = 0;
 
@@ -54,6 +73,8 @@ function flush(): void {
   resultRows.clear();
   aspectRows.clear();
   extraRows.clear();
+  derivedRows.clear();
+  bulk.clear();
 }
 
 function schedule(): void {
@@ -66,6 +87,30 @@ export function flushGridChangesNow(): void {
     cancelAnimationFrame(scheduled);
     flush();
   }
+}
+
+/**
+ * Report changed rows for a family, from code that writes buffers directly
+ * rather than through an action payload (the calculation engine).
+ */
+export function notifyRowsChanged(
+  kind: ChangeKind,
+  rows: Int32Array,
+  count: number,
+): void {
+  if (count === 0) return;
+
+  if (count > BULK_THRESHOLD) {
+    bulk.add(kind);
+  } else {
+    const target =
+      kind === 'result' ? resultRows
+      : kind === 'aspect' ? aspectRows
+      : kind === 'extra' ? extraRows
+      : derivedRows;
+    for (let i = 0; i < count; i++) target.add(rows[i]);
+  }
+  schedule();
 }
 
 export const gridSyncMiddleware: Middleware = () => (next) => (action) => {

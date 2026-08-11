@@ -1,17 +1,24 @@
 import { useCallback, useState, type RefObject } from 'react';
 import type { GridApi } from 'ag-grid-community';
 
-import { ENTITY_COUNT, RESULT_SIZE } from '../types';
+import { ENTITY_COUNT, INPUT_RESULT_COLUMNS } from '../types';
 import { useAppStore } from '../store/hooks';
-import { setResultValue } from '../store/resultsSlice';
+import { setResultInputs } from '../store/resultsSlice';
 import { mainEntityIdOfRow } from '../store/selectors';
 import { measureDispatch } from '../perf/perfMonitor';
 import type { GridRow } from './gridRows';
 
-/** Fresh values for one result. Randomness lives here, outside the reducer. */
-function randomResultValue(): number[] {
-  const value = new Array<number>(RESULT_SIZE);
-  for (let i = 0; i < RESULT_SIZE; i++) {
+/**
+ * Fresh values for one result's *inputs*. Randomness lives here, outside the
+ * reducer.
+ *
+ * Only the 9 input slots: R10-R12 belong to the calculation, and writing
+ * arbitrary numbers into them would put visibly wrong answers on screen for the
+ * frame before the engine corrects them.
+ */
+function randomResultInputs(): number[] {
+  const value = new Array<number>(INPUT_RESULT_COLUMNS);
+  for (let i = 0; i < INPUT_RESULT_COLUMNS; i++) {
     value[i] = Math.round(Math.random() * 10000) / 100;
   }
   return value;
@@ -40,9 +47,9 @@ export function Toolbar({ gridApiRef }: ToolbarProps) {
    */
   const mutateRandomEntity = useCallback(() => {
     const row = Math.floor(Math.random() * ENTITY_COUNT);
-    const value = randomResultValue();
+    const value = randomResultInputs();
 
-    measureDispatch('random entity', 1, () => store.dispatch(setResultValue(row, value)));
+    measureDispatch('random entity', 1, () => store.dispatch(setResultInputs(row, value)));
 
     setLast({ mainEntityId: mainEntityIdOfRow(row), row, origin: 'anywhere', count: 1 });
   }, [store]);
@@ -64,18 +71,23 @@ export function Toolbar({ gridApiRef }: ToolbarProps) {
     if (!node?.data) return;
 
     const { row, id } = node.data;
-    const value = randomResultValue();
+    const value = randomResultInputs();
 
-    measureDispatch('on-screen entity', 1, () => store.dispatch(setResultValue(row, value)));
+    measureDispatch('on-screen entity', 1, () => store.dispatch(setResultInputs(row, value)));
 
     setLast({ mainEntityId: id, row, origin: 'on-screen', count: 1 });
   }, [gridApiRef, store]);
 
   /**
-   * Stress case: 1,000 random entities rewritten in one go — 12,000 individual
-   * numbers. gridSync coalesces the whole burst into a single refresh on the
+   * Stress case: 1,000 random entities rewritten in one go — 9,000 individual
+   * inputs. gridSync coalesces the whole burst into a single refresh on the
    * next frame, so this stays one frame's worth of work rather than 1,000
    * separate updates.
+   *
+   * It is also the reliable way to trigger a *full* recalculation: rewriting 2%
+   * of the population moves the column means well past the drift threshold, so
+   * the cached baselines stop being valid and all 50,000 rows have to be
+   * recomputed.
    */
   const stressMutate = useCallback(() => {
     const count = 1000;
@@ -83,11 +95,11 @@ export function Toolbar({ gridApiRef }: ToolbarProps) {
     const values = new Array<number[]>(count);
     for (let i = 0; i < count; i++) {
       rows[i] = Math.floor(Math.random() * ENTITY_COUNT);
-      values[i] = randomResultValue();
+      values[i] = randomResultInputs();
     }
 
     measureDispatch('stress x1000', count, () => {
-      for (let i = 0; i < count; i++) store.dispatch(setResultValue(rows[i], values[i]));
+      for (let i = 0; i < count; i++) store.dispatch(setResultInputs(rows[i], values[i]));
     });
 
     setLast({ mainEntityId: mainEntityIdOfRow(rows[0]), row: rows[0], origin: 'stress', count });
@@ -115,7 +127,7 @@ export function Toolbar({ gridApiRef }: ToolbarProps) {
           {last.count > 1 ? (
             <>
               Rewrote <strong>{last.count.toLocaleString()}</strong> results —{' '}
-              {(last.count * RESULT_SIZE).toLocaleString()} numbers
+              {(last.count * INPUT_RESULT_COLUMNS).toLocaleString()} inputs
             </>
           ) : (
             <>
