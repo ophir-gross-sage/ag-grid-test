@@ -1,14 +1,13 @@
 import { useCallback } from 'react';
-import { useAppSelector } from '../store/hooks';
+import { useAppDispatch, useAppSelector } from '../store/hooks';
 import { calcEngine } from '../calc/calcEngine';
+import { calcCountersReset, type CalcStatus } from '../store/calcSlice';
 import { FRAME_BUDGET_MS } from '../perf/perfMonitor';
-import type { CalcStatus } from '../store/calcSlice';
 
 const STATUS_TEXT: Record<CalcStatus, string> = {
   idle: 'up to date',
-  scheduled: 'queued',
+  stale: 'stale — recalculating',
   calculating: 'calculating…',
-  stale: 'showing stale values',
 };
 
 /**
@@ -21,10 +20,13 @@ const STATUS_TEXT: Record<CalcStatus, string> = {
  */
 export function CalcPanel() {
   const calc = useAppSelector((s) => s.calc);
+  const dispatch = useAppDispatch();
 
   const forceFull = useCallback(() => calcEngine.requestFullRecalc(), []);
+  const reset = useCallback(() => dispatch(calcCountersReset()), [dispatch]);
 
   const overBudget = calc.lastLongestBlockMs > FRAME_BUDGET_MS;
+  const worstOverBudget = calc.worstBlockingMs > FRAME_BUDGET_MS;
 
   return (
     <div className="calc-panel">
@@ -38,19 +40,21 @@ export function CalcPanel() {
 
       <dl className="calc-stats">
         <div>
-          <dt>last pass</dt>
-          <dd>{calc.scope === 'none' ? '—' : calc.scope}</dd>
+          <dt title="Discovered by running it — nothing upstream chose this">outcome</dt>
+          <dd>
+            {calc.cold ? '—' : calc.cascaded ? 'cascaded (all rows)' : 'local'}
+          </dd>
         </div>
         <div>
-          <dt title="Time from the input change to computed values on screen">latency</dt>
-          <dd>{calc.scope === 'none' ? '—' : `${calc.lastLatencyMs.toFixed(1)} ms`}</dd>
+          <dt title="From the input change to computed values on screen">latency</dt>
+          <dd>{calc.cold ? '—' : `${calc.lastLatencyMs.toFixed(1)} ms`}</dd>
         </div>
         <div>
           <dt title="Longest uninterrupted main-thread block. Over one frame means dropped frames.">
             longest block
           </dt>
           <dd className={overBudget ? 'bad' : 'good'}>
-            {calc.scope === 'none' ? '—' : `${calc.lastLongestBlockMs.toFixed(2)} ms`}
+            {calc.cold ? '—' : `${calc.lastLongestBlockMs.toFixed(2)} ms`}
           </dd>
         </div>
         <div>
@@ -61,16 +65,19 @@ export function CalcPanel() {
           </dd>
         </div>
         <div>
-          <dt title="Population drift that decided incremental vs full">drift</dt>
-          <dd>
-            {calc.lastDrift.toFixed(3)} σ
+          <dt title="The tail is what the scheduling decision is about">worst block</dt>
+          <dd className={worstOverBudget ? 'bad' : 'good'}>
+            {calc.worstBlockingMs ? `${calc.worstBlockingMs.toFixed(1)} ms` : '—'}
           </dd>
         </div>
         <div>
-          <dt>passes</dt>
+          <dt>runs</dt>
           <dd>
-            {calc.incrementalCount.toLocaleString()} inc ·{' '}
-            {calc.fullCount.toLocaleString()} full
+            {calc.localCount.toLocaleString()} local ·{' '}
+            {calc.cascadeCount.toLocaleString()} cascaded
+            <button type="button" className="link" onClick={reset}>
+              reset
+            </button>
           </dd>
         </div>
       </dl>

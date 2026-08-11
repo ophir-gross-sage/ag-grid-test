@@ -1,91 +1,46 @@
-import {
-  COL_COMPOSITE,
-  ENTITY_COUNT,
-  INPUT_RESULT_COLUMNS,
-  RESULT_SIZE,
-} from '../types';
+import { ENTITY_COUNT } from '../types';
 import type { AppStore } from '../store';
 import { calcCompleted, calcScheduled, calcStarted } from '../store/calcSlice';
 import { notifyRowsChanged } from '../store/gridSync';
-import {
-  baselineDrift,
-  computeBaselines,
-  computeColumnSums,
-  computeComposite,
-  computeCompositeDistribution,
-  computeDispersion,
-  createBaselines,
-  percentileOf,
-  writeRow,
-  type Baselines,
-} from './calcKernel';
-import type {
-  CalcRequest,
-  CalcRunner,
-  CalcRunnerFactory,
-  CalcWork,
-  ChunkProgress,
-} from './calcTypes';
+import { calculate, calculateChunked, createCalcState, type CalcState } from './calcKernel';
+import type { CalcRequest, CalcRunner, CalcRunnerFactory, CalcWork } from './calcTypes';
 
 /**
- * Orchestrates the calculation: decides what needs recomputing, runs it through
- * a `CalcRunner`, and publishes the results.
+ * Orchestrates the calculation: collects what changed, runs it through a
+ * `CalcRunner`, and publishes whatever came back.
  *
  * Decoupled from the UI in both directions. It never imports React, ag-grid, or
  * a component, and nothing in the UI calls it directly — it is driven by store
  * actions via `calcMiddleware` and reports back through `calcSlice` and
- * `gridSync`. The UI could be deleted and this would keep working; that is what
- * makes it testable headlessly and what allows the runner to be swapped for a
- * worker without touching a component.
+ * `gridSync`. The UI could be deleted and this would keep working.
  *
  * ---------------------------------------------------------------------------
- * Deciding scope
+ * What this engine deliberately does *not* do
  *
- * The engine maintains running sums of the input columns, updated by the deltas
- * `calcMiddleware` hands it. Before each pass it asks the kernel how far those
- * sums have drifted from the baselines currently in use:
+ * It does not decide scope, predict cost, or know which rows will be affected.
+ * Earlier versions did — they maintained running column sums, measured
+ * population drift, and chose "incremental" or "full" before dispatching. All
+ * of that was deleted, because the real calculation cannot predict which rows
+ * it will touch, and a scheduler built on a prediction the production
+ * implementation cannot make is a scheduler that will not survive contact with
+ * it.
  *
- *   drift <= FULL_RECALC_DRIFT_THRESHOLD  ->  incremental, dirty rows only
- *   drift >  FULL_RECALC_DRIFT_THRESHOLD  ->  full pass, all 50,000 rows
+ * So the engine's job is only:
  *
- * The test is O(9) regardless of how much data changed, so deciding is never
- * itself a cost. A single small edit takes the cheap path; a bulk mutation
- * moves the population and takes the expensive one.
+ *   1. Accumulate the rows whose inputs changed (the seeds).
+ *   2. Coalesce a burst of them into one run.
+ *   3. Hand them to the runner.
+ *   4. Publish the affected set the calculation *reports back*.
+ *
+ * Scope and cost arrive as results. Every run must be assumed capable of
+ * costing 50ms, because none of them can be known to be cheap in advance.
  */
-
-/**
- * Mean shift, in standard deviations, past which cached baselines are no longer
- * considered a fair description of the population.
- *
- * Low enough that bulk changes reliably trigger a full pass, high enough that
- * ordinary single-cell editing does not. This is the knob that trades
- * correctness of the normalisation against how often the 50ms pass runs — in a
- * real system it belongs to the domain, not to the scheduler.
- */
-export const FULL_RECALC_DRIFT_THRESHOLD = 0.02;
-
-/**
- * Fraction of the population that can be recomputed incrementally before the
- * cached R10 distribution is no longer trustworthy.
- *
- * The second invalidation rule, and it catches what drift alone misses.
- * Replacing 1,000 rows of uniform-random values with different uniform-random
- * values barely moves any column mean — drift stays near zero and the baselines
- * really are still valid. But R12 is a *percentile*, so it depends on the shape
- * of the whole R10 distribution, and 1,000 rows landing in new places reshuffles
- * ranks for rows that were never touched.
- *
- * Without this rule the percentile column silently rots: every individual
- * incremental pass is locally correct, and the population-level answer drifts
- * further from the truth with each one.
- */
-export const FULL_RECALC_CHURN_FRACTION = 0.005;
 
 export interface CalcEngine {
   attach(store: AppStore, runnerFactory: CalcRunnerFactory): void;
-  /** Report an input change. Cheap; safe to call from a middleware on every action. */
-  markRowDirty(row: number, columnDeltaSum: Float64Array | null): void;
-  /** Force a full pass regardless of drift. */
+  /** Report that a row's inputs changed. Cheap; safe to call on every action. */
+  markRowDirty(row: number): void;
+  /** Force a recalculation of the whole population. */
   requestFullRecalc(): void;
   /** Swap the execution strategy at runtime. */
   setRunner(factory: CalcRunnerFactory): void;
@@ -97,180 +52,84 @@ export function createCalcEngine(): CalcEngine {
   let store: AppStore | null = null;
   let runner: CalcRunner | null = null;
 
-  const baselines: Baselines = createBaselines();
-  /** Running sums of input columns, maintained incrementally from edit deltas. */
-  const columnSum = new Float64Array(INPUT_RESULT_COLUMNS);
-  let columnSumValid = false;
+  /** Opaque to the engine — it is threaded through to the kernel and never inspected. */
+  const state: CalcState = createCalcState(ENTITY_COUNT);
 
-  /** Rows with changed inputs awaiting recomputation. */
   const dirtyRows = new Set<number>();
   /** Preallocated hand-off buffers, so scheduling never allocates. */
-  const dirtyScratch = new Int32Array(ENTITY_COUNT);
+  const seedScratch = new Int32Array(ENTITY_COUNT);
   const changedScratch = new Int32Array(ENTITY_COUNT);
-  /** R10 for every row, needed as an intermediate before percentiles can be assigned. */
-  const compositeScratch = new Float64Array(ENTITY_COUNT);
 
   let forceFull = false;
   let scheduled = 0;
   let requestedAt = 0;
-  /** Rows recomputed incrementally since the last full pass. Drives the churn rule. */
-  let churnSinceFull = 0;
 
   function results(): Float64Array {
     return store!.getState().results.values;
   }
 
-  // --- Applying a pass ------------------------------------------------------
-
-  /**
-   * Recompute the given rows against the cached baselines.
-   *
-   * Note what this does *not* do: it does not rebuild the R10 distribution, so
-   * R12 is computed against the distribution as it was. That is the deliberate
-   * approximation an incremental pass buys — one row's move cannot meaningfully
-   * shift a 50,000-row percentile curve, and the drift test catches the point
-   * where enough of them accumulate that it can.
-   */
-  function runIncremental(rows: Int32Array, rowCount: number): number {
-    const values = results();
-    let changedCount = 0;
-
-    for (let i = 0; i < rowCount; i++) {
-      const row = rows[i];
-      const composite = computeComposite(values, row, baselines);
-      const dispersion = computeDispersion(values, row);
-      const percentile = percentileOf(composite, baselines);
-      if (writeRow(values, row, composite, dispersion, percentile)) {
-        changedScratch[changedCount++] = row;
-      }
-    }
-
-    publishChanges(changedCount);
-    return changedCount;
-  }
-
-  /** The ~50ms pass: baselines, then every row, then the distribution, then every row again. */
-  function runFull(): number {
-    const values = results();
-
-    computeBaselines(values, ENTITY_COUNT, baselines);
-    computeColumnSums(values, ENTITY_COUNT, columnSum);
-    columnSumValid = true;
-
-    for (let row = 0; row < ENTITY_COUNT; row++) {
-      compositeScratch[row] = computeComposite(values, row, baselines);
-    }
-    computeCompositeDistribution(compositeScratch, ENTITY_COUNT, baselines);
-
-    let changedCount = 0;
-    for (let row = 0; row < ENTITY_COUNT; row++) {
-      const composite = compositeScratch[row];
-      const dispersion = computeDispersion(values, row);
-      const percentile = percentileOf(composite, baselines);
-      if (writeRow(values, row, composite, dispersion, percentile)) {
-        changedScratch[changedCount++] = row;
-      }
-    }
-
-    publishChanges(changedCount);
-    return changedCount;
-  }
-
-  /**
-   * The same full pass, yielding between chunks.
-   *
-   * Kept in step with `runFull` by construction — same phases, same order — so
-   * a runner that yields produces bit-identical output to one that doesn't.
-   * Unused by the synchronous runner, but present so that choosing a
-   * time-slicing route later is a change of runner and nothing else.
-   */
-  function* runFullChunked(): Generator<ChunkProgress, number> {
-    const CHUNK = 4000;
-    const values = results();
-
-    computeBaselines(values, ENTITY_COUNT, baselines);
-    computeColumnSums(values, ENTITY_COUNT, columnSum);
-    columnSumValid = true;
-    yield { done: 0, total: ENTITY_COUNT * 2 };
-
-    for (let start = 0; start < ENTITY_COUNT; start += CHUNK) {
-      const end = Math.min(start + CHUNK, ENTITY_COUNT);
-      for (let row = start; row < end; row++) {
-        compositeScratch[row] = computeComposite(values, row, baselines);
-      }
-      yield { done: end, total: ENTITY_COUNT * 2 };
-    }
-
-    computeCompositeDistribution(compositeScratch, ENTITY_COUNT, baselines);
-
-    let changedCount = 0;
-    for (let start = 0; start < ENTITY_COUNT; start += CHUNK) {
-      const end = Math.min(start + CHUNK, ENTITY_COUNT);
-      for (let row = start; row < end; row++) {
-        const composite = compositeScratch[row];
-        const dispersion = computeDispersion(values, row);
-        const percentile = percentileOf(composite, baselines);
-        if (writeRow(values, row, composite, dispersion, percentile)) {
-          changedScratch[changedCount++] = row;
-        }
-      }
-      // Publish as we go: partial results are visible immediately rather than
-      // withheld until the whole pass lands.
-      publishChanges(changedCount);
-      changedCount = 0;
-      yield { done: ENTITY_COUNT + end, total: ENTITY_COUNT * 2 };
-    }
-
-    return changedCount;
-  }
-
   /** Hand changed rows to the grid. Bulk-collapses above a threshold; see `gridSync`. */
-  function publishChanges(changedCount: number): void {
-    if (changedCount > 0) {
-      notifyRowsChanged('result', changedScratch, changedCount);
-    }
+  function publish(changedCount: number): void {
+    if (changedCount > 0) notifyRowsChanged('result', changedScratch, changedCount);
   }
 
-  const work: CalcWork = { runIncremental, runFull, runFullChunked };
+  const work: CalcWork = {
+    run(seeds, seedCount) {
+      const outcome = calculate(
+        results(),
+        ENTITY_COUNT,
+        seeds,
+        seedCount,
+        state,
+        changedScratch,
+      );
+      publish(outcome.changed);
+      return outcome;
+    },
+
+    *runChunked(seeds, seedCount, chunkRows) {
+      const iterator = calculateChunked(
+        results(),
+        ENTITY_COUNT,
+        seeds,
+        seedCount,
+        state,
+        changedScratch,
+        chunkRows,
+      );
+      let step = iterator.next();
+      while (!step.done) {
+        yield step.value;
+        step = iterator.next();
+      }
+      publish(step.value.changed);
+      return step.value;
+    },
+  };
 
   // --- Scheduling -----------------------------------------------------------
 
-  function decideAndSubmit(): void {
+  function submit(): void {
     scheduled = 0;
     if (!store || !runner) return;
 
-    const needsFull = forceFull || !baselines.valid || !columnSumValid;
-    const drift = baselines.valid && columnSumValid
-      ? baselineDrift(columnSum, ENTITY_COUNT, baselines)
-      : Infinity;
-
-    const churn = churnSinceFull + dirtyRows.size;
-    const full =
-      needsFull ||
-      drift > FULL_RECALC_DRIFT_THRESHOLD ||
-      churn > ENTITY_COUNT * FULL_RECALC_CHURN_FRACTION;
-
-    if (!full && dirtyRows.size === 0) return;
-
-    let rowCount = 0;
-    if (full) {
-      churnSinceFull = 0;
-    } else {
-      for (const row of dirtyRows) dirtyScratch[rowCount++] = row;
-      churnSinceFull = churn;
+    let seedCount = 0;
+    if (!forceFull) {
+      for (const row of dirtyRows) seedScratch[seedCount++] = row;
+      if (seedCount === 0) return;
     }
     dirtyRows.clear();
     forceFull = false;
 
-    const request: CalcRequest = {
-      scope: full ? 'full' : 'incremental',
-      rows: dirtyScratch,
-      rowCount,
-      requestedAt,
-      drift: Number.isFinite(drift) ? drift : 0,
-    };
+    const request: CalcRequest = { seeds: seedScratch, seedCount, requestedAt };
 
-    store.dispatch(calcScheduled({ scope: request.scope, stale: full }));
+    /**
+     * Announced as 'stale' rather than 'scheduled' because that is the honest
+     * description: computed values on screen no longer match their inputs, and
+     * we cannot say how long that will remain true — the calculation might
+     * settle in 1ms or cascade for 50ms, and there is no way to know which.
+     */
+    store.dispatch(calcScheduled({ stale: true }));
     runner.submit(request);
   }
 
@@ -278,14 +137,12 @@ export function createCalcEngine(): CalcEngine {
     if (scheduled !== 0) return;
     requestedAt = performance.now();
     /**
-     * Coalesce on a frame boundary. A burst of 1,000 edits must produce one
-     * decision, not 1,000 — and deferring to the frame means the raw edit
-     * paints before the calculation starts competing for the thread.
+     * Coalesce on a frame boundary. A burst of 1,000 edits must produce one run,
+     * not 1,000 — and since any run may cost 50ms, collapsing a burst into a
+     * single run is worth far more here than it was when runs were cheap.
      */
-    scheduled = requestAnimationFrame(decideAndSubmit);
+    scheduled = requestAnimationFrame(submit);
   }
-
-  // --- Public surface -------------------------------------------------------
 
   function buildRunner(factory: CalcRunnerFactory): CalcRunner {
     return factory({
@@ -299,17 +156,12 @@ export function createCalcEngine(): CalcEngine {
     attach(nextStore, runnerFactory) {
       store = nextStore;
       runner = buildRunner(runnerFactory);
-      // Nothing has been computed yet, so the first pass is unconditionally full.
+      // Nothing has been computed yet, so the first run covers everything.
       forceFull = true;
       schedule();
     },
 
-    markRowDirty(row, columnDeltaSum) {
-      if (columnDeltaSum && columnSumValid) {
-        for (let col = 0; col < INPUT_RESULT_COLUMNS; col++) {
-          columnSum[col] += columnDeltaSum[col];
-        }
-      }
+    markRowDirty(row) {
       dirtyRows.add(row);
       schedule();
     },
@@ -342,6 +194,3 @@ export function createCalcEngine(): CalcEngine {
 
 /** The app's engine. A singleton because there is one store and one dataset. */
 export const calcEngine = createCalcEngine();
-
-/** Column offset of the first computed slot, re-exported for the middleware's delta maths. */
-export { COL_COMPOSITE, INPUT_RESULT_COLUMNS, RESULT_SIZE };

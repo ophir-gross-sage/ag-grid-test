@@ -1,28 +1,35 @@
-import type { CalcScope } from '../store/calcSlice';
+import type { CalcResult } from './calcKernel';
 
 /**
  * The seam between *what* is calculated and *when* it runs.
  *
- * The engine decides scope and applies results; a `CalcRunner` decides how the
- * work reaches the CPU — all at once, sliced across frames, or off-thread. Every
- * option in `docs/calculation-options.md` is a different implementation of this
- * one interface, which is why picking a route is a swap in `calcEngine.ts`
+ * The engine collects seeds and publishes outcomes; a `CalcRunner` decides how
+ * the work reaches the CPU — all at once, sliced across frames, or off-thread.
+ * Every option in `docs/calculation-options.md` is a different implementation of
+ * this one interface, which is why picking a route is a swap in `main.tsx`
  * rather than a rewrite.
  */
 
 export interface CalcRequest {
-  scope: Exclude<CalcScope, 'none'>;
-  /** Rows to recompute for an incremental pass. Ignored when scope is 'full'. */
-  rows: Int32Array;
-  rowCount: number;
-  /** When the work became necessary. Latency is measured from here, not from start of execution. */
+  /** Rows whose inputs changed. What the calculation does with them is its own business. */
+  seeds: Int32Array;
+  seedCount: number;
+  /**
+   * When the work became necessary. Latency is measured from here rather than
+   * from the start of execution, because time spent queued is time the user
+   * spends looking at stale values.
+   */
   requestedAt: number;
-  /** Population drift that triggered a full pass, for reporting. */
-  drift: number;
 }
 
 export interface CalcOutcome {
-  scope: CalcScope;
+  /**
+   * Whether the run ended up recomputing the whole population.
+   *
+   * An outcome, not a request. Nothing upstream chose this or could have
+   * predicted it.
+   */
+  cascaded: boolean;
   /** Requested-to-applied wall clock. What the user actually waits. */
   latencyMs: number;
   /** Total main-thread time consumed. */
@@ -31,7 +38,6 @@ export interface CalcOutcome {
   longestBlockMs: number;
   changedRows: number;
   visitedRows: number;
-  drift: number;
 }
 
 /**
@@ -39,33 +45,22 @@ export interface CalcOutcome {
  * they never look at the store themselves.
  */
 export interface CalcWork {
-  /**
-   * Recompute the given rows using the cached baselines.
-   * Cheap and always safe to run inline. Returns rows actually changed.
-   */
-  runIncremental(rows: Int32Array, rowCount: number): number;
+  /** Run to completion. Cost is unknown until it returns. */
+  run(seeds: Int32Array, seedCount: number): CalcResult;
 
   /**
-   * Recompute baselines and every row. This is the ~50ms pass.
-   * Returns rows actually changed.
-   */
-  runFull(): number;
-
-  /**
-   * A full pass expressed as resumable chunks, for runners that need to yield.
+   * The same run, yielding after roughly `chunkRows` rows.
    *
-   * Present on the interface from the start even though the synchronous runner
-   * ignores it: a kernel that cannot be interrupted forecloses half the options
-   * below, and discovering that after choosing one is the expensive way to find
-   * out.
+   * On the interface from the start even though the synchronous runner ignores
+   * it: whether the *real* calculation can be interrupted is the single
+   * question that decides which options exist at all, so the capability is
+   * modelled here rather than assumed later.
    */
-  runFullChunked(): Iterator<ChunkProgress, number>;
-}
-
-export interface ChunkProgress {
-  /** Rows completed so far. */
-  done: number;
-  total: number;
+  runChunked(
+    seeds: Int32Array,
+    seedCount: number,
+    chunkRows: number,
+  ): Generator<number, CalcResult>;
 }
 
 export interface CalcRunner {

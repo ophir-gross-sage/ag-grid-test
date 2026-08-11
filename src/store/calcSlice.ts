@@ -4,78 +4,77 @@ import { createSlice, type PayloadAction } from '@reduxjs/toolkit';
  * Observable state of the calculation engine.
  *
  * The engine writes its *output* into `resultsSlice` (R10-R12), so this slice
- * holds no data — only the freshness and cost of the last pass. It exists so
- * the UI can show what the engine is doing without importing the engine, and so
- * the engine never needs to know a UI exists.
+ * holds no data — only the freshness and cost of the last run. It exists so the
+ * UI can show what the engine is doing without importing the engine, and so the
+ * engine never needs to know a UI exists.
  */
-
-export type CalcScope = 'none' | 'incremental' | 'full';
 
 export type CalcStatus =
   /** Computed results agree with their inputs. */
   | 'idle'
-  /** Inputs changed; a pass is queued but hasn't started. */
-  | 'scheduled'
-  /** A pass is in flight. */
-  | 'calculating'
   /**
-   * On-screen computed values are known to be behind their inputs.
+   * Inputs changed and the computed values on screen no longer match them.
    *
-   * Worth distinguishing from 'calculating': this is the state where the grid
-   * is showing numbers it knows are wrong, which is the thing the user asked
-   * to minimise.
+   * There is deliberately no separate 'queued' state. We cannot say whether the
+   * pending run will settle in 1ms or cascade for 50ms, so promising anything
+   * more specific than "what you're looking at is behind" would be a guess.
    */
-  | 'stale';
+  | 'stale'
+  /** A run is in flight. */
+  | 'calculating';
 
 export interface CalcState {
   status: CalcStatus;
-  scope: CalcScope;
-  /** Wall-clock time from scheduling to results applied. */
+  /** Whether the last run recomputed the whole population. Discovered, not requested. */
+  cascaded: boolean;
+  /** Wall-clock time from the input change to results on screen. */
   lastLatencyMs: number;
-  /** Main-thread time the last pass occupied. Equals latency only when it ran synchronously. */
+  /** Main-thread time the last run occupied. Equals latency only when it ran synchronously. */
   lastBlockingMs: number;
-  /** Longest uninterrupted main-thread block during the last pass. */
+  /** Longest uninterrupted main-thread block during the last run. */
   lastLongestBlockMs: number;
   /** Rows whose computed values actually moved. */
   lastChangedRows: number;
-  /** Rows the last pass had to visit, changed or not. */
+  /** Rows the last run visited, changed or not. */
   lastVisitedRows: number;
-  fullCount: number;
-  incrementalCount: number;
-  /** How far the population had drifted when a full pass was last triggered. */
-  lastDrift: number;
+  /** Runs so far, split by what they turned out to be. */
+  localCount: number;
+  cascadeCount: number;
+  /** Worst blocking time seen this session. The tail is the thing being managed. */
+  worstBlockingMs: number;
+  /** True until the first run completes. */
+  cold: boolean;
 }
 
 const initialState: CalcState = {
   status: 'idle',
-  scope: 'none',
+  cascaded: false,
   lastLatencyMs: 0,
   lastBlockingMs: 0,
   lastLongestBlockMs: 0,
   lastChangedRows: 0,
   lastVisitedRows: 0,
-  fullCount: 0,
-  incrementalCount: 0,
-  lastDrift: 0,
+  localCount: 0,
+  cascadeCount: 0,
+  worstBlockingMs: 0,
+  cold: true,
 };
 
 export interface CalcCompletedPayload {
-  scope: CalcScope;
+  cascaded: boolean;
   latencyMs: number;
   blockingMs: number;
   longestBlockMs: number;
   changedRows: number;
   visitedRows: number;
-  drift: number;
 }
 
 const calcSlice = createSlice({
   name: 'calc',
   initialState,
   reducers: {
-    calcScheduled(state, action: PayloadAction<{ scope: CalcScope; stale: boolean }>) {
-      state.status = action.payload.stale ? 'stale' : 'scheduled';
-      state.scope = action.payload.scope;
+    calcScheduled(state, action: PayloadAction<{ stale: boolean }>) {
+      if (action.payload.stale) state.status = 'stale';
     },
     calcStarted(state) {
       state.status = 'calculating';
@@ -83,19 +82,23 @@ const calcSlice = createSlice({
     calcCompleted(state, action: PayloadAction<CalcCompletedPayload>) {
       const p = action.payload;
       state.status = 'idle';
-      state.scope = p.scope;
+      state.cold = false;
+      state.cascaded = p.cascaded;
       state.lastLatencyMs = p.latencyMs;
       state.lastBlockingMs = p.blockingMs;
       state.lastLongestBlockMs = p.longestBlockMs;
       state.lastChangedRows = p.changedRows;
       state.lastVisitedRows = p.visitedRows;
-      state.lastDrift = p.drift;
-      if (p.scope === 'full') state.fullCount++;
-      else if (p.scope === 'incremental') state.incrementalCount++;
+      if (p.cascaded) state.cascadeCount++;
+      else state.localCount++;
+      if (p.longestBlockMs > state.worstBlockingMs) {
+        state.worstBlockingMs = p.longestBlockMs;
+      }
     },
     calcCountersReset(state) {
-      state.fullCount = 0;
-      state.incrementalCount = 0;
+      state.localCount = 0;
+      state.cascadeCount = 0;
+      state.worstBlockingMs = 0;
     },
   },
 });
@@ -103,11 +106,3 @@ const calcSlice = createSlice({
 export const { calcScheduled, calcStarted, calcCompleted, calcCountersReset } =
   calcSlice.actions;
 export const calcReducer = calcSlice.reducer;
-
-/** Action types the engine emits. The calc middleware ignores these, which is what breaks the loop. */
-export const CALC_ACTION_TYPES: ReadonlySet<string> = new Set([
-  calcScheduled.type,
-  calcStarted.type,
-  calcCompleted.type,
-  calcCountersReset.type,
-]);

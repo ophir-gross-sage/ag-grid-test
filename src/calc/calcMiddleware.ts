@@ -1,21 +1,17 @@
 import type { Middleware } from '@reduxjs/toolkit';
-import { INPUT_RESULT_COLUMNS, RESULT_SIZE } from '../types';
-import {
-  setResultCell,
-  setResultInputs,
-  setResultValue,
-  type ResultsState,
-} from '../store/resultsSlice';
+import { INPUT_RESULT_COLUMNS } from '../types';
+import { setResultCell, setResultInputs, setResultValue } from '../store/resultsSlice';
 import { calcEngine } from './calcEngine';
 
 /**
  * Turns input changes into calculation triggers.
  *
- * This is the only wire between the store and the engine, and it runs *before*
- * the reducer so it can read the previous value. The engine needs the delta,
- * not the new value: it maintains running column sums so it can answer "have
- * the population baselines drifted?" in O(9), without rescanning 50,000 rows
- * just to decide whether a rescan is needed.
+ * The only wire between the store and the engine, and it is deliberately thin:
+ * it reports *that* a row's inputs changed and nothing else. An earlier version
+ * also computed per-column deltas so the engine could maintain running sums and
+ * predict whether a full pass was needed. That was deleted along with the
+ * prediction it fed — the real calculation decides its own scope internally, so
+ * computing inputs for a decision nobody makes anymore was pure overhead.
  *
  * Two things keep the system from feeding itself:
  *
@@ -25,43 +21,21 @@ import { calcEngine } from './calcEngine';
  *   - Even if there were, only input columns are watched. Computed columns are
  *     never inputs, so a computed write cannot dirty the row that produced it.
  */
-
-/** Reused across dispatches; the middleware runs on a hot path and must not allocate. */
-const deltaScratch = new Float64Array(INPUT_RESULT_COLUMNS);
-
-export const calcMiddleware: Middleware = (api) => (next) => (action) => {
+export const calcMiddleware: Middleware = () => (next) => (action) => {
+  const result = next(action);
   const type = (action as { type?: string })?.type;
 
   if (type === setResultCell.type) {
-    const { row, col, value } = (action as ReturnType<typeof setResultCell>).payload;
+    const { row, col } = (action as ReturnType<typeof setResultCell>).payload;
     // Writes to computed columns are the engine's own; they trigger nothing.
-    if (col >= INPUT_RESULT_COLUMNS) return next(action);
-
-    const previous = (api.getState() as { results: ResultsState }).results.values[
-      row * RESULT_SIZE + col
-    ];
-    const result = next(action);
-
-    deltaScratch.fill(0);
-    deltaScratch[col] = value - previous;
-    calcEngine.markRowDirty(row, deltaScratch);
+    if (col < INPUT_RESULT_COLUMNS) calcEngine.markRowDirty(row);
     return result;
   }
 
   if (type === setResultInputs.type || type === setResultValue.type) {
-    const { row, value } = (action as ReturnType<typeof setResultInputs>).payload;
-    const values = (api.getState() as { results: ResultsState }).results.values;
-    const base = row * RESULT_SIZE;
-
-    deltaScratch.fill(0);
-    for (let col = 0; col < INPUT_RESULT_COLUMNS; col++) {
-      deltaScratch[col] = value[col] - values[base + col];
-    }
-
-    const result = next(action);
-    calcEngine.markRowDirty(row, deltaScratch);
-    return result;
+    const { row } = (action as ReturnType<typeof setResultInputs>).payload;
+    calcEngine.markRowDirty(row);
   }
 
-  return next(action);
+  return result;
 };

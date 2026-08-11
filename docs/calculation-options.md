@@ -1,222 +1,209 @@
 # Scheduling the calculation — options
 
-## What is actually being decided
+## The constraint that determines everything
 
-Only the **full pass** is in question.
+**The calculation cannot predict which rows it will affect, or what it will
+cost, until it has run.**
 
-| Pass | Trigger | Cost (measured) | Verdict |
+Most runs settle quickly. Occasionally one cascades across the whole population.
+The same trigger produces both, and nothing upstream can tell them apart in
+advance. Measured, production build, 50,000 rows:
+
+| Trigger | Outcome | Longest block | Frequency |
 | --- | --- | --- | --- |
-| Incremental | one or a few rows dirty, baselines still valid | **0.1–1.3 ms** | Already optimal. Leave it inline. |
-| Full | baselines drifted, or >0.5% of rows churned | **44–56 ms** | This is the problem. |
+| Single cell edit | local | **1.0–3.3 ms** (median 2.1) | 12 / 14 |
+| Single cell edit | **cascaded** | **46.1 ms and 67.1 ms** | 2 / 14 |
+| Bulk 1,000 rows | cascaded | 51–58 ms | always |
 
-The incremental path is not worth scheduling. A pass costing 0.1ms gains nothing
-from being deferred, sliced, or moved to a worker, and would pay scheduling
-latency and coordination cost for the privilege. Every option below applies to
-the full pass only, and every option keeps the incremental path exactly as it is.
+Twelve cheap runs and two expensive ones, from *identically shaped triggers*.
+That is the whole problem in one line.
+
+Three consequences, and they eliminate more options than they leave:
+
+1. **You cannot route by cost.** "Run cheap ones inline, expensive ones
+   elsewhere" is unimplementable — by the time you know which you have, you have
+   already paid for it.
+2. **You cannot compute the visible rows first.** Prioritising the ~30 rows on
+   screen requires knowing they are in the affected set. You don't, and often
+   they aren't: a run that visited 1,465 rows changed exactly 1.
+3. **Every run must be treated as though it will be the 50ms one.** There is no
+   fast path to protect, only a tail to bound.
+
+Consequence 2 is worth dwelling on, because viewport-first ordering is the
+obvious idea and it does not survive here. It was my recommendation before this
+constraint was clear; it is off the table now.
 
 ## The baseline, measured
 
-Chromium, production build, 50,000 rows. `syncRunner`, on the main thread:
+`syncRunner`, main thread, run to completion:
 
-- **44–56 ms** uninterrupted main-thread block per full pass
-- **6 dropped frames** per bulk mutation, 2 of them over 50ms
-- Nothing paints during it. Scrolling stops. The `calculating` status **cannot
-  be shown at all** — `onStart` and `onOutcome` are dispatched inside the same
-  task, so the spinner state never reaches a paint.
+- **1–3 ms** for the common case — genuinely optimal, nothing to improve
+- **46–67 ms** on a cascade
+- **6 dropped frames** per bulk mutation, 5 of them over 50ms
+- The `calculating` status **cannot be shown at all** — `onStart` and
+  `onOutcome` land in the same task, so it never reaches a paint
 
-That last point is the one to sit with: with a synchronous full pass, the UI
-cannot even tell the user it is busy.
+The common case needs no help. The entire decision is about the tail.
 
-## The two requirements are in tension
+## The one unknown that splits the option space
 
-> keep the main thread unblocked … view changes and calculations as quickly as possible
+**Can the real calculation be interrupted mid-run and resumed?**
 
-Unblocking the thread means yielding it, and yielding costs wall-clock latency.
-Anything that makes the calculation less disruptive makes it finish later. The
-options differ mainly in *where they spend that tradeoff*, so the useful question
-is not "which is fastest" but **"fast for whom"**:
+Everything hinges on it:
 
-- **Time to correct visible values** — what the user perceives.
-- **Time to a globally consistent dataset** — what an export or a downstream
-  consumer needs.
+- **If yes** → main-thread time-slicing (B) is available: no data movement, no
+  concurrency, no headers.
+- **If no** → every main-thread option is dead, because a 50ms opaque call
+  cannot be made to yield from outside. The only remaining move is to run it
+  somewhere that isn't the main thread (C/D).
 
-These can be separated, and Option E is the observation that they should be.
+`calculateChunked()` in the kernel implements the interruptible form so the
+option can be measured rather than assumed. But note what interruptibility still
+does **not** buy here: the percentile phase needs every composite before any
+single row's final value is known, so two thirds of a cascade produces nothing
+displayable. **Yielding buys responsiveness, not earlier answers.**
 
 ---
 
-## Option A — Synchronous on the main thread *(current)*
-
-Run it to completion, inline.
+## Option A — Synchronous *(current)*
 
 | | |
 | --- | --- |
-| Effort | none, already built |
-| Time to visible values | ~50 ms |
-| Time to consistent dataset | ~50 ms — **best possible** |
-| Longest block | **44–56 ms** (3 frames) |
+| Effort | none |
+| Common case | **1–3 ms — optimal** |
+| Tail | 46–67 ms block, 5–6 dropped frames |
 | Cancellable | no |
-| Risk | none |
 
-Genuinely the right answer when full passes are rare *and* user-initiated — a
-brief freeze after an explicit "recalculate" click reads as "it's working". It is
-the wrong answer when passes are triggered by ordinary editing, which is the case
-here.
+Right for the common case, indefensible for the tail. Keep as the fallback path.
 
 ## Option B — Time-slice on the main thread
 
-Run the full pass in chunks, yielding between them via `scheduler.postTask()`
-(or `MessageChannel` for older targets — **not** `requestIdleCallback`, which can
-starve indefinitely under load).
-
-`calcEngine.runFullChunked()` already exists and already publishes partial
-results per chunk, so this is a new runner and nothing else.
+Chunk the run, yield via `scheduler.postTask()` (or `MessageChannel`; **not**
+`requestIdleCallback`, which starves under load).
 
 | | |
 | --- | --- |
-| Effort | **low** — ~50 lines, no data restructuring |
-| Time to visible values | ~5 ms with Option E, else ~60–90 ms *(estimate)* |
-| Time to consistent dataset | ~60–90 ms *(estimate)* — yield overhead + competing with render |
-| Longest block | **bounded by chunk size** (~4 ms) *(estimate)* |
-| Cancellable | **yes, trivially** — stop iterating |
+| Effort | **low** — a runner, ~60 lines; `calculateChunked` exists |
+| Common case | ~1–4 ms *(estimate)* — yield overhead on work that was already cheap |
+| Tail | **block bounded to chunk size (~4 ms)**; wall clock stretches to ~70–100 ms *(estimate)* |
+| Cancellable | **yes, trivially** |
 | Risk | low |
+| Requires | the calculation to be interruptible |
 
-Still consumes main-thread CPU, so it competes with scrolling — the calculation
-gets slower while the user scrolls, and scrolling gets slightly less smooth.
-It does not *unblock* the thread so much as **stop hogging it**, which for a
-50ms job is usually enough.
+Does not unblock the thread so much as **stop hogging it**. The tail gets
+*longer* in wall-clock terms while becoming invisible — which is the correct
+trade when the alternative is a 60ms freeze.
 
-Its quiet advantage: results appear progressively instead of all at once, which
-serves "view changes as quickly as possible" directly rather than as a side
-effect.
+Its real weakness: it still spends main-thread CPU, so a cascade during
+scrolling makes both worse.
 
 ## Option C — Web Worker + `SharedArrayBuffer`
-
-Move the kernel to a worker. The results buffer becomes shared memory, so there
-is no copying at all.
 
 | | |
 | --- | --- |
 | Effort | **high** |
-| Time to visible values | ~50 ms, or ~5 ms with Option E *(estimate)* |
-| Time to consistent dataset | ~50 ms *(estimate)* — full speed, nothing competing |
-| Longest block | **<1 ms** — only the cell refresh |
-| Cancellable | yes, with a shared abort flag |
+| Common case | ~2–4 ms *(estimate)* — round-trip overhead added to cheap work |
+| Tail | **<1 ms main thread**; ~50 ms off-thread |
+| Cancellable | yes, via a shared abort flag |
 | Risk | **moderate–high** |
+| Requires | cross-origin isolation; concurrency handling |
 
-The best steady-state answer, and the only one that leaves the main thread
-genuinely free. Three costs, none of them small:
+The only option that leaves the main thread genuinely free, and the only one
+that works if the calculation cannot be interrupted. Three costs:
 
-1. **`SharedArrayBuffer` requires cross-origin isolation** (COOP + COEP headers).
-   That is a deployment constraint, and it breaks third-party embeds, some auth
-   iframes, and analytics scripts. Confirm this is acceptable *before* choosing
-   this route — it is the most common reason this option dies late.
-2. **Concurrent mutation is now a real race.** The user can edit R1–R9 while the
-   worker is reading them. Today that is impossible; with a worker it needs
-   double-buffering, a generation counter, or `Atomics`. This is the actual
-   engineering work, not the worker plumbing.
-3. The store's buffers must be allocated as SAB-backed from the start.
+1. **COOP/COEP headers.** Breaks third-party embeds, some auth iframes,
+   analytics. Confirm before committing — this is the most common reason this
+   option dies late.
+2. **Concurrent mutation becomes a real race.** The user can edit R1–R9 while
+   the worker reads them. Impossible today. Needs double-buffering, a generation
+   counter, or `Atomics`. **This is the actual work**, not the worker plumbing.
+3. Store buffers must be SAB-backed from allocation.
 
 ## Option D — Web Worker + copied `ArrayBuffer`
 
-Same, but post a copy of the inputs instead of sharing memory.
-
 | | |
 | --- | --- |
 | Effort | moderate |
-| Time to visible values | ~55 ms *(estimate)* |
-| Time to consistent dataset | ~55 ms *(estimate)* |
-| Longest block | **~1–3 ms** — the copy of 4.8 MB, each way |
-| Cancellable | yes (ignore the stale reply) |
+| Common case | ~3–6 ms *(estimate)* — copy dominates cheap runs |
+| Tail | **~1–3 ms main thread** (the copy); ~50 ms off-thread |
+| Cancellable | yes — ignore the stale reply |
 | Risk | low–moderate |
 
-No COOP/COEP, and the copy makes the race in Option C disappear: the worker gets
-a snapshot, so concurrent edits are simply applied to a newer generation.
-Memory roughly doubles, and a copy is charged on every pass.
+No headers, and the copy makes C's race vanish: the worker gets a snapshot, so
+concurrent edits simply belong to a newer generation. Costs ~1–3 ms of copying
+per run and roughly doubles memory.
 
-Note that *transferring* rather than copying does not work here — transfer moves
-the buffer, and the grid reads it on every paint.
+Transferring instead of copying does not work — transfer *moves* the buffer, and
+the grid reads it every paint.
 
-## Option E — Viewport-first ordering *(a modifier, not an alternative)*
+Note the asymmetry this creates: a fixed ~2ms tax on the 12 cheap runs to remove
+the 2 expensive ones. At the measured ratio that is clearly worth it, but it is
+a real cost, not a free win.
 
-Compute the ~30 visible rows first, publish them, then do the other 49,970.
+## Option E — Hybrid: speculative inline with a deadline
 
-Composable with B, C, or D, and it is the highest-leverage change available for
-the stated primary requirement:
-
-> **0.06% of the work covers 100% of what the user can see.**
-
-Correct visible values in **~1–5 ms** instead of ~50ms, regardless of which
-execution strategy sits underneath.
+Start on the main thread. If the run hasn't finished within ~5ms, abandon it and
+restart on a worker.
 
 | | |
 | --- | --- |
-| Effort | **low** |
-| Time to visible values | **~1–5 ms** *(estimate)* |
-| Time to consistent dataset | unchanged |
-| Risk | low |
+| Effort | high — needs both B and D built |
+| Common case | **1–3 ms — optimal, no overhead** |
+| Tail | ~5 ms wasted, then off-thread |
+| Requires | interruptibility **and** a worker |
 
-The engine needs a viewport hint, which is a mild coupling — but it can be
-pushed *in* (`engine.setPriorityRows(...)` called from the grid's scroll
-handler) rather than pulled, so the engine still knows nothing about ag-grid or
-React.
+The only option that gets the common case *and* the tail right, because it is
+the only one that makes the cheap/expensive decision **after** the information
+exists. It pays for that with both implementations plus the abandon-and-restart
+logic, and wastes ~5ms on every cascade.
 
-One caveat worth stating: rows are then briefly inconsistent with each other —
-visible rows are computed against new baselines while off-screen rows still hold
-old ones. Fine for display; **not** fine if something exports or aggregates
-mid-pass.
+Worth it only if the common case is latency-critical *and* cascades are frequent
+enough to matter.
 
-## Option F — Optimistic incremental, then reconcile
+## Option F — Deduplicate and coalesce harder
 
-Always run the cheap incremental pass immediately, show the result, and schedule
-the full pass at lower priority. Mark values provisional until it lands.
+Already partly present (rAF coalescing of bursts). Could extend to: drop
+superseded runs, skip recalculation while a cell editor is open.
 
-| | |
-| --- | --- |
-| Effort | moderate |
-| Time to visible values | **~1 ms** |
-| Time to consistent dataset | deferred, possibly seconds |
-| Risk | moderate — needs a "provisional" visual state |
-
-Best perceived latency of any option. The cost is honesty: the grid shows values
-that are approximately right and known to be so. That is a **product** decision,
-not a technical one — worth surfacing before adopting.
+Cheap, complements everything else, solves nothing on its own. Worth doing
+regardless of which option is chosen — at the measured 50ms tail, *not* running a
+calculation is by far the cheapest way to make it fast.
 
 ---
 
 ## Recommendation
 
-**Phase 1: E + B.** Viewport-first ordering on a time-sliced main-thread runner.
+**If the calculation can be interrupted: B, then re-measure.**
+Lowest effort, no headers, no concurrency, no data movement, trivially
+reversible. It bounds the tail to ~4ms blocks, which is the stated requirement,
+and it costs about a day. Go to D or E only if measurement shows the stretched
+wall-clock hurts.
 
-- Gets perceived latency to ~5ms, which is the stated primary requirement.
-- Removes the dropped frames.
-- No headers, no serialization, no concurrency, no data restructuring.
-- Roughly a day's work, and `runFullChunked` is already written.
-- Fully reversible: it is one runner swap in `main.tsx`.
+**If it cannot be interrupted: D.**
+Not C. D gets you the same main-thread relief without cross-origin isolation and
+without the concurrent-mutation race, which is the expensive part of C. Adopt C
+over D only if the ~2ms copy per run is measurably a problem *and* isolation is
+confirmed acceptable — in that order.
 
-**Phase 2: add C or D, if measurement says Phase 1 is not enough.** The reason to
-defer is that a worker's benefit is bounded — it removes ~45ms of main-thread
-*work*, but Option E has already removed ~45ms of main-thread *latency the user
-can perceive*. Spending the concurrency budget before confirming the need is how
-this kind of thing gets expensive.
+**Do F regardless.** It is nearly free.
 
-Take the worker route earlier if any of these hold:
-- Full passes fire continuously rather than per interaction.
-- The real calculation is much heavier than 50ms (the kernel constant is one
-  line, so this is easy to test — raise it and re-measure).
-- The main thread already has other heavy work competing.
+The honest summary: the common case is already optimal and no option improves
+it — every one of them makes it slightly worse. This is entirely a decision
+about how to pay for the tail.
 
 ## What would sharpen this
 
-Three things I could not determine from here, each of which moves the answer:
+1. **Can the real calculation yield?** Decides B vs D and therefore the whole
+   plan. Nothing else matters as much.
+2. **How often does a cascade actually fire?** The simulation says ~1 in 7 for
+   single edits; that ratio drives whether a fixed per-run tax (D) beats a
+   variable one (B).
+3. **Is cross-origin isolation acceptable?** Only relevant if C is being
+   considered over D.
+4. **Can a cascade be superseded?** If a newer edit arrives mid-cascade, is
+   abandoning the in-flight run correct, or must every run complete? Cancellable
+   runs make B and D substantially more effective.
 
-1. **How often does a full pass actually fire?** Once per user action, or
-   continuously from a data feed? If it is continuous, B is not enough and C
-   becomes the right first move rather than the second.
-2. **Is cross-origin isolation acceptable in the real deployment?** If not, C is
-   off the table entirely and the choice is B or D.
-3. **May the grid show provisional values?** If yes, F is available and is
-   strictly the fastest perceived option. If no, F is out regardless of cost.
-
-I can prototype the recommended runner and measure it against the baseline in
-this repo — say the word and I will, rather than leaving B's numbers as
-estimates.
+I can build the recommended runner behind the existing `CalcRunner` seam and
+measure it against this baseline — B's and D's numbers here are estimates, and
+they don't have to stay that way.

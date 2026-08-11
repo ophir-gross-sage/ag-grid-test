@@ -281,3 +281,277 @@ export function writeRow(
   results[base + COL_PERCENTILE] = percentile;
   return changed;
 }
+
+// ---------------------------------------------------------------------------
+// The black box
+// ---------------------------------------------------------------------------
+
+/**
+ * Everything past this point models the property that matters most about the
+ * real calculation: **the caller cannot predict what it will do.**
+ *
+ * Not which rows it will touch, and not how long it will take. The caller hands
+ * it the rows whose inputs changed and gets back a set of rows whose outputs
+ * changed — and the two have no reliable relationship. A one-cell edit may
+ * settle in 1ms touching a few hundred rows, or cascade across the entire
+ * population and cost 50ms+.
+ *
+ * That unpredictability is a hard constraint on scheduling, not a detail:
+ *
+ *   - You cannot route cheap runs inline and expensive runs elsewhere, because
+ *     you do not know which one you have until it has already run.
+ *   - You cannot compute the visible rows first, because you do not know
+ *     whether the visible rows are even in the affected set.
+ *   - Every single run has to be treated as though it might be the 50ms one.
+ *
+ * The propagation rules below are therefore deliberately sealed inside this
+ * boundary. The engine could technically import them; it must not, because the
+ * real calculation will not offer them.
+ */
+
+/**
+ * Rows a single changed row drags in with it, as a range.
+ *
+ * Sized so a lone edit lands in the 1-5ms band at roughly 0.8µs/row, and varied
+ * per row so cost is not a constant — two edits that look identical from the
+ * outside legitimately cost different amounts, which is the property being
+ * modelled.
+ */
+const CONE_MIN = 800;
+const CONE_SPREAD = 4200;
+
+/**
+ * Once this share of the population is implicated, propagating further is
+ * pointless — recompute everything and rebuild the global baselines while we're
+ * here. This is the main path from a small edit to a 50ms pass.
+ */
+const CASCADE_FRACTION = 0.25;
+
+/**
+ * Rows recomputable locally before the cached R10 distribution is rebuilt.
+ *
+ * Each local run is correct for the rows it touches while leaving the
+ * population-level percentile progressively less true, so this bounds how far
+ * that can rot. It must sit comfortably above the cone size, or every run
+ * cascades and the cheap path never happens.
+ */
+const CHURN_LIMIT_FRACTION = 0.2;
+
+export interface CalcState {
+  baselines: Baselines;
+  /** Rows recomputed without a cascade since the last full pass. */
+  churn: number;
+  /** Marks which rows are in the current affected set; stamped by generation to avoid clearing. */
+  mark: Int32Array;
+  generation: number;
+  /** The affected set, materialised. */
+  affected: Int32Array;
+  /** Scratch for R10 across the population, needed before percentiles can be assigned. */
+  composite: Float64Array;
+}
+
+export function createCalcState(rowCount: number): CalcState {
+  return {
+    baselines: createBaselines(),
+    churn: 0,
+    mark: new Int32Array(rowCount),
+    generation: 0,
+    affected: new Int32Array(rowCount),
+    composite: new Float64Array(rowCount),
+  };
+}
+
+export interface CalcResult {
+  /** Rows the calculation actually visited. Discovered, never predicted. */
+  visited: number;
+  /** Rows whose computed outputs actually moved. */
+  changed: number;
+  /** Whether it ended up recomputing the whole population. */
+  cascaded: boolean;
+}
+
+/**
+ * Expands the seed rows into the affected set, or reports that it cascaded.
+ *
+ * The cone is deterministic in the row index rather than random, so a given
+ * edit implicates the same rows every time — real dependency graphs are fixed
+ * structure, not dice.
+ */
+function propagate(
+  state: CalcState,
+  seeds: Int32Array,
+  seedCount: number,
+  rowCount: number,
+): number {
+  const cascadeLimit = rowCount * CASCADE_FRACTION;
+  state.generation++;
+  const { mark, affected, generation } = state;
+  let count = 0;
+
+  for (let i = 0; i < seedCount; i++) {
+    const seed = seeds[i];
+    let cursor = seed;
+    const cone = CONE_MIN + ((Math.imul(seed, 2654435761) >>> 0) % CONE_SPREAD);
+    for (let step = 0; step < cone; step++) {
+      // Cheap invertible scatter: dependents are spread across the population
+      // rather than sitting next to each other, as a real dependency graph would.
+      cursor = (cursor * 1103515245 + 12345 + step) >>> 0;
+      const row = cursor % rowCount;
+      if (mark[row] !== generation) {
+        mark[row] = generation;
+        affected[count++] = row;
+        if (count >= cascadeLimit) return -1;
+      }
+    }
+    if (mark[seed] !== generation) {
+      mark[seed] = generation;
+      affected[count++] = seed;
+    }
+  }
+  return count;
+}
+
+/** Recomputes the whole population, rebuilding baselines and the percentile distribution. */
+function recomputeAll(
+  results: Float64Array,
+  rowCount: number,
+  state: CalcState,
+  changedOut: Int32Array,
+): number {
+  const { baselines, composite } = state;
+
+  computeBaselines(results, rowCount, baselines);
+  for (let row = 0; row < rowCount; row++) {
+    composite[row] = computeComposite(results, row, baselines);
+  }
+  computeCompositeDistribution(composite, rowCount, baselines);
+
+  let changed = 0;
+  for (let row = 0; row < rowCount; row++) {
+    const dispersion = computeDispersion(results, row);
+    const percentile = percentileOf(composite[row], baselines);
+    if (writeRow(results, row, composite[row], dispersion, percentile)) {
+      changedOut[changed++] = row;
+    }
+  }
+  state.churn = 0;
+  return changed;
+}
+
+/**
+ * Run the calculation.
+ *
+ * The single entry point, and the only thing the engine is allowed to call.
+ * Scope, cost and affected set are all outputs.
+ */
+export function calculate(
+  results: Float64Array,
+  rowCount: number,
+  seeds: Int32Array,
+  seedCount: number,
+  state: CalcState,
+  changedOut: Int32Array,
+): CalcResult {
+  // No baselines yet, or the caller asked for everything.
+  if (!state.baselines.valid || seedCount === 0) {
+    return { visited: rowCount, changed: recomputeAll(results, rowCount, state, changedOut), cascaded: true };
+  }
+
+  const affectedCount = propagate(state, seeds, seedCount, rowCount);
+  const churnLimit = rowCount * CHURN_LIMIT_FRACTION;
+
+  if (affectedCount < 0 || state.churn + affectedCount > churnLimit) {
+    return { visited: rowCount, changed: recomputeAll(results, rowCount, state, changedOut), cascaded: true };
+  }
+
+  const { baselines, affected } = state;
+  let changed = 0;
+  for (let i = 0; i < affectedCount; i++) {
+    const row = affected[i];
+    const composite = computeComposite(results, row, baselines);
+    const dispersion = computeDispersion(results, row);
+    const percentile = percentileOf(composite, baselines);
+    if (writeRow(results, row, composite, dispersion, percentile)) {
+      changedOut[changed++] = row;
+    }
+  }
+  state.churn += affectedCount;
+
+  return { visited: affectedCount, changed, cascaded: false };
+}
+
+/**
+ * The same calculation, yielding between chunks.
+ *
+ * Whether the *real* calculation can offer this is the single most important
+ * unknown for choosing a scheduling strategy — a black box that cannot be
+ * interrupted rules out every main-thread option at once, leaving only "move it
+ * to another thread". It is implemented here so that the option can be measured
+ * rather than assumed.
+ *
+ * Note what it still cannot do: yield *early with useful partial results for a
+ * particular row*. The percentile phase needs every composite before any row's
+ * final value is known, so the first two thirds of the work produce nothing
+ * displayable. Interruptibility buys responsiveness, not earlier answers.
+ */
+export function* calculateChunked(
+  results: Float64Array,
+  rowCount: number,
+  seeds: Int32Array,
+  seedCount: number,
+  state: CalcState,
+  changedOut: Int32Array,
+  chunkRows: number,
+): Generator<number, CalcResult> {
+  const affectedCount =
+    state.baselines.valid && seedCount > 0
+      ? propagate(state, seeds, seedCount, rowCount)
+      : -1;
+  const churnLimit = rowCount * CHURN_LIMIT_FRACTION;
+  const cascaded = affectedCount < 0 || state.churn + affectedCount > churnLimit;
+
+  const { baselines, composite, affected } = state;
+  let changed = 0;
+
+  if (!cascaded) {
+    for (let start = 0; start < affectedCount; start += chunkRows) {
+      const end = Math.min(start + chunkRows, affectedCount);
+      for (let i = start; i < end; i++) {
+        const row = affected[i];
+        const c = computeComposite(results, row, baselines);
+        const d = computeDispersion(results, row);
+        const p = percentileOf(c, baselines);
+        if (writeRow(results, row, c, d, p)) changedOut[changed++] = row;
+      }
+      yield end;
+    }
+    state.churn += affectedCount;
+    return { visited: affectedCount, changed, cascaded: false };
+  }
+
+  computeBaselines(results, rowCount, baselines);
+  yield 0;
+
+  for (let start = 0; start < rowCount; start += chunkRows) {
+    const end = Math.min(start + chunkRows, rowCount);
+    for (let row = start; row < end; row++) {
+      composite[row] = computeComposite(results, row, baselines);
+    }
+    yield end;
+  }
+
+  computeCompositeDistribution(composite, rowCount, baselines);
+
+  for (let start = 0; start < rowCount; start += chunkRows) {
+    const end = Math.min(start + chunkRows, rowCount);
+    for (let row = start; row < end; row++) {
+      const d = computeDispersion(results, row);
+      const p = percentileOf(composite[row], baselines);
+      if (writeRow(results, row, composite[row], d, p)) changedOut[changed++] = row;
+    }
+    yield rowCount + end;
+  }
+
+  state.churn = 0;
+  return { visited: rowCount, changed, cascaded: true };
+}
