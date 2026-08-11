@@ -156,6 +156,12 @@ src/
     gridSync.ts             middleware: which rows changed -> rAF-batched notifications
     selectors.ts            read* (hot, allocation-free) and select* (materialising)
     index.ts, hooks.ts      store config and typed hooks
+  calc/
+    calcKernel.ts           pure arithmetic + the resumable run state machine
+    calcEngine.ts           orchestration, coalescing, publishing
+    calcTypes.ts            the CalcRunner seam
+    calcMiddleware.ts       store changes -> calculation triggers
+    runners/                sync (server path) and time-sliced (browser path)
   components/
     gridRows.ts             the immutable row array
     EntityGrid.tsx          column defs, valueGetters/valueSetters, batch refresh
@@ -163,6 +169,33 @@ src/
     PerfHud.tsx             live frame-budget readout
   perf/perfMonitor.ts       task timings + frame-health loop
 ```
+
+## The calculation
+
+`R1–R9` are user inputs; `R10–R12` are computed by the calculation engine and
+written back into the same results. Editing an input triggers a run.
+
+The engine cannot predict what a run will do. Most settle in 1–3ms touching a few
+thousand rows; some cascade across all 50,000 and cost 50ms+. Identical triggers
+produce both, so every run is treated as though it will be the expensive one.
+
+It runs **on the main thread, in 4ms time-sliced chunks**, yielding between them
+so the browser can paint. Not on a worker — the calculation is the product, it
+runs on the server too, and hiding its cost behind a thread boundary would
+remove the pressure that keeps it fast.
+
+| CPU throttle | Synchronous | Time-sliced |
+| --- | --- | --- |
+| 1× | 64.7 ms block | **4.2 ms** |
+| 4× | 275 ms block | **5.1 ms** |
+| 6× | **408 ms block** | **6.0 ms** |
+
+The budget is a *duration*, not a row count, which is why it holds across a 6×
+hardware range — a fixed 4,000-row chunk would have gone 4 → 24ms and broken on
+exactly the machines it was meant to protect.
+
+Both runners are selectable at runtime from the calculation panel.
+`docs/calculation-options.md` covers the design decisions and what's still open.
 
 ## Where this would need more work
 

@@ -28,7 +28,9 @@ export const createSyncRunner: CalcRunnerFactory = (host) => ({
     host.onStart();
 
     const startedAt = performance.now();
-    const result = host.work.run(request.seeds, request.seedCount);
+    host.work.begin(request.seeds, request.seedCount);
+    host.work.advance(Infinity);
+    const result = host.work.outcome();
     const blockingMs = performance.now() - startedAt;
 
     host.onOutcome({

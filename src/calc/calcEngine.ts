@@ -2,7 +2,15 @@ import { ENTITY_COUNT } from '../types';
 import type { AppStore } from '../store';
 import { calcCompleted, calcScheduled, calcStarted } from '../store/calcSlice';
 import { notifyRowsChanged } from '../store/gridSync';
-import { calculate, calculateChunked, createCalcState, type CalcState } from './calcKernel';
+import {
+  advanceRun,
+  beginRun,
+  createCalcState,
+  createRun,
+  runResult,
+  type CalcRun,
+  type CalcState,
+} from './calcKernel';
 import type { CalcRequest, CalcRunner, CalcRunnerFactory, CalcWork } from './calcTypes';
 
 /**
@@ -52,8 +60,9 @@ export function createCalcEngine(): CalcEngine {
   let store: AppStore | null = null;
   let runner: CalcRunner | null = null;
 
-  /** Opaque to the engine — it is threaded through to the kernel and never inspected. */
+  /** Opaque to the engine — threaded through to the kernel and never inspected. */
   const state: CalcState = createCalcState(ENTITY_COUNT);
+  const run: CalcRun = createRun();
 
   const dirtyRows = new Set<number>();
   /** Preallocated hand-off buffers, so scheduling never allocates. */
@@ -63,47 +72,52 @@ export function createCalcEngine(): CalcEngine {
   let forceFull = false;
   let scheduled = 0;
   let requestedAt = 0;
+  /** True from submission until the runner reports an outcome. */
+  let inFlight = false;
 
   function results(): Float64Array {
     return store!.getState().results.values;
   }
 
-  /** Hand changed rows to the grid. Bulk-collapses above a threshold; see `gridSync`. */
-  function publish(changedCount: number): void {
-    if (changedCount > 0) notifyRowsChanged('result', changedScratch, changedCount);
+  /**
+   * Hand the grid whatever changed since the last call.
+   *
+   * Called after every slice, not just at the end. A sliced run therefore
+   * repaints progressively: rows finalised in the first slice are on screen
+   * while later ones are still being computed. `gridSync` bulk-collapses above
+   * a threshold, so publishing often costs no more than publishing once.
+   */
+  function publishNew(): void {
+    const fresh = run.changedCount - run.publishedCount;
+    if (fresh <= 0) return;
+    notifyRowsChanged(
+      'result',
+      changedScratch.subarray(run.publishedCount, run.changedCount),
+      fresh,
+    );
+    run.publishedCount = run.changedCount;
   }
 
   const work: CalcWork = {
-    run(seeds, seedCount) {
-      const outcome = calculate(
-        results(),
-        ENTITY_COUNT,
-        seeds,
-        seedCount,
-        state,
-        changedScratch,
-      );
-      publish(outcome.changed);
-      return outcome;
+    begin(seeds, seedCount) {
+      beginRun(run, state, seeds, seedCount);
     },
 
-    *runChunked(seeds, seedCount, chunkRows) {
-      const iterator = calculateChunked(
+    advance(deadlineMs) {
+      const done = advanceRun(
         results(),
         ENTITY_COUNT,
-        seeds,
-        seedCount,
         state,
+        run,
         changedScratch,
-        chunkRows,
+        deadlineMs,
       );
-      let step = iterator.next();
-      while (!step.done) {
-        yield step.value;
-        step = iterator.next();
-      }
-      publish(step.value.changed);
-      return step.value;
+      publishNew();
+      return done;
+    },
+
+    outcome() {
+      return runResult(run);
     },
   };
 
@@ -113,6 +127,20 @@ export function createCalcEngine(): CalcEngine {
     scheduled = 0;
     if (!store || !runner) return;
 
+    /**
+     * Coalescing rule 2: never start a second run while one is in flight.
+     *
+     * Seeds keep accumulating in `dirtyRows` and go out in a single follow-up
+     * when the current run finishes. Without this, a sliced run — which spans
+     * many frames — would have a fresh run launched on top of it by every edit
+     * arriving meanwhile, and they would fight over the same buffers.
+     *
+     * This is also where the cheapest possible optimisation lives: the fastest
+     * calculation is the one that never runs. At a 50ms tail, *not* running is
+     * worth more than any amount of making it faster.
+     */
+    if (inFlight) return;
+
     let seedCount = 0;
     if (!forceFull) {
       for (const row of dirtyRows) seedScratch[seedCount++] = row;
@@ -120,6 +148,7 @@ export function createCalcEngine(): CalcEngine {
     }
     dirtyRows.clear();
     forceFull = false;
+    inFlight = true;
 
     const request: CalcRequest = { seeds: seedScratch, seedCount, requestedAt };
 
@@ -137,9 +166,8 @@ export function createCalcEngine(): CalcEngine {
     if (scheduled !== 0) return;
     requestedAt = performance.now();
     /**
-     * Coalesce on a frame boundary. A burst of 1,000 edits must produce one run,
-     * not 1,000 — and since any run may cost 50ms, collapsing a burst into a
-     * single run is worth far more here than it was when runs were cheap.
+     * Coalescing rule 1: collapse a burst on a frame boundary. A thousand edits
+     * in one tick must produce one run, not a thousand.
      */
     scheduled = requestAnimationFrame(submit);
   }
@@ -148,7 +176,12 @@ export function createCalcEngine(): CalcEngine {
     return factory({
       work,
       onStart: () => store?.dispatch(calcStarted()),
-      onOutcome: (outcome) => store?.dispatch(calcCompleted(outcome)),
+      onOutcome: (outcome) => {
+        inFlight = false;
+        store?.dispatch(calcCompleted(outcome));
+        // Anything that arrived while we were busy goes out now, as one run.
+        if (dirtyRows.size > 0 || forceFull) schedule();
+      },
     });
   }
 

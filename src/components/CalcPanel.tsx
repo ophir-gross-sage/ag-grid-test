@@ -1,6 +1,7 @@
-import { useCallback } from 'react';
+import { useCallback, useState } from 'react';
 import { useAppDispatch, useAppSelector } from '../store/hooks';
 import { calcEngine } from '../calc/calcEngine';
+import { DEFAULT_RUNNER, RUNNERS } from '../calc/runners';
 import { calcCountersReset, type CalcStatus } from '../store/calcSlice';
 import { FRAME_BUDGET_MS } from '../perf/perfMonitor';
 
@@ -25,6 +26,18 @@ export function CalcPanel() {
   const forceFull = useCallback(() => calcEngine.requestFullRecalc(), []);
   const reset = useCallback(() => dispatch(calcCountersReset()), [dispatch]);
 
+  const [runnerId, setRunnerId] = useState(DEFAULT_RUNNER.id);
+  const changeRunner = useCallback(
+    (event: React.ChangeEvent<HTMLSelectElement>) => {
+      const choice = RUNNERS.find((r) => r.id === event.target.value);
+      if (!choice) return;
+      setRunnerId(choice.id);
+      calcEngine.setRunner(choice.factory);
+      dispatch(calcCountersReset());
+    },
+    [dispatch],
+  );
+
   const overBudget = calc.lastLongestBlockMs > FRAME_BUDGET_MS;
   const worstOverBudget = calc.worstBlockingMs > FRAME_BUDGET_MS;
 
@@ -33,6 +46,18 @@ export function CalcPanel() {
       <div className="calc-head">
         <span className={`calc-dot calc-${calc.status}`} />
         <span className="calc-status">Calculation · {STATUS_TEXT[calc.status]}</span>
+        <select
+          className="runner-select"
+          value={runnerId}
+          onChange={changeRunner}
+          title={RUNNERS.find((r) => r.id === runnerId)?.description}
+        >
+          {RUNNERS.map((r) => (
+            <option key={r.id} value={r.id}>
+              {r.label}
+            </option>
+          ))}
+        </select>
         <button type="button" className="secondary small" onClick={forceFull}>
           Force full recalc
         </button>

@@ -45,22 +45,20 @@ export interface CalcOutcome {
  * they never look at the store themselves.
  */
 export interface CalcWork {
-  /** Run to completion. Cost is unknown until it returns. */
-  run(seeds: Int32Array, seedCount: number): CalcResult;
+  /** Arm a run. Does no work. */
+  begin(seeds: Int32Array, seedCount: number): void;
 
   /**
-   * The same run, yielding after roughly `chunkRows` rows.
+   * Advance the armed run until `deadlineMs`. Returns `true` when complete, and
+   * publishes any rows that changed since the last call.
    *
-   * On the interface from the start even though the synchronous runner ignores
-   * it: whether the *real* calculation can be interrupted is the single
-   * question that decides which options exist at all, so the capability is
-   * modelled here rather than assumed later.
+   * `Infinity` runs it straight through — that is what the synchronous runner
+   * and the server both do.
    */
-  runChunked(
-    seeds: Int32Array,
-    seedCount: number,
-    chunkRows: number,
-  ): Generator<number, CalcResult>;
+  advance(deadlineMs: number): boolean;
+
+  /** Result of the run that just completed. */
+  outcome(): CalcResult;
 }
 
 export interface CalcRunner {

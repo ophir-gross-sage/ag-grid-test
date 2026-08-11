@@ -337,6 +337,27 @@ const CASCADE_FRACTION = 0.25;
  */
 const CHURN_LIMIT_FRACTION = 0.2;
 
+
+/**
+ * How many rows are processed between deadline checks.
+ *
+ * `performance.now()` is not free, so checking it per row would show up in a
+ * kernel this hot. 256 rows is ~0.2ms of work on a fast machine and ~1.2ms on a
+ * slow one — fine-grained enough to honour a 4ms budget, coarse enough to be
+ * invisible.
+ */
+const DEADLINE_CHECK_INTERVAL = 256;
+
+/** Phases of a run, in order. A run always ends at DONE. */
+const PHASE_PROPAGATE = 0;
+const PHASE_LOCAL = 1;
+const PHASE_BASELINE = 2;
+const PHASE_COMPOSITE = 3;
+const PHASE_RANGE = 4;
+const PHASE_HISTOGRAM = 5;
+const PHASE_FINALISE = 6;
+const PHASE_DONE = 7;
+
 export interface CalcState {
   baselines: Baselines;
   /** Rows recomputed without a cascade since the last full pass. */
@@ -361,6 +382,58 @@ export function createCalcState(rowCount: number): CalcState {
   };
 }
 
+/**
+ * A run in progress.
+ *
+ * All the mutable position of a calculation, lifted out of the call stack so it
+ * can be put down and picked up again. This is what makes the kernel resumable
+ * *without* restructuring it: the inner loops below are byte-identical to what
+ * they would be in a straight-line implementation, and only the outer bounds
+ * and a phase counter differ.
+ *
+ * Generators were the obvious alternative and were rejected. `yield` inside a
+ * hot numeric loop costs real throughput, and this kernel runs on the server
+ * too, where nothing yields and every cycle counts.
+ */
+export interface CalcRun {
+  phase: number;
+  /** Position within the current phase. */
+  cursor: number;
+  seeds: Int32Array;
+  seedCount: number;
+  affectedCount: number;
+  cascaded: boolean;
+  visited: number;
+  /** Rows written into `changedOut` so far. Grows across slices. */
+  changedCount: number;
+  /** How many of those the caller has already been handed. */
+  publishedCount: number;
+
+  // Accumulators that must survive a yield.
+  sum: Float64Array;
+  sumSq: Float64Array;
+  min: number;
+  max: number;
+}
+
+export function createRun(): CalcRun {
+  return {
+    phase: PHASE_DONE,
+    cursor: 0,
+    seeds: new Int32Array(0),
+    seedCount: 0,
+    affectedCount: 0,
+    cascaded: false,
+    visited: 0,
+    changedCount: 0,
+    publishedCount: 0,
+    sum: new Float64Array(INPUT_RESULT_COLUMNS),
+    sumSq: new Float64Array(INPUT_RESULT_COLUMNS),
+    min: Infinity,
+    max: -Infinity,
+  };
+}
+
 export interface CalcResult {
   /** Rows the calculation actually visited. Discovered, never predicted. */
   visited: number;
@@ -370,79 +443,40 @@ export interface CalcResult {
   cascaded: boolean;
 }
 
-/**
- * Expands the seed rows into the affected set, or reports that it cascaded.
- *
- * The cone is deterministic in the row index rather than random, so a given
- * edit implicates the same rows every time — real dependency graphs are fixed
- * structure, not dice.
- */
-function propagate(
+/** Arms a run. Does no work — the first `advanceRun` does. */
+export function beginRun(
+  run: CalcRun,
   state: CalcState,
   seeds: Int32Array,
   seedCount: number,
-  rowCount: number,
-): number {
-  const cascadeLimit = rowCount * CASCADE_FRACTION;
+): void {
+  run.cursor = 0;
+  run.seeds = seeds;
+  run.seedCount = seedCount;
+  run.affectedCount = 0;
+  run.visited = 0;
+  run.changedCount = 0;
+  run.publishedCount = 0;
+  run.min = Infinity;
+  run.max = -Infinity;
+  run.sum.fill(0);
+  run.sumSq.fill(0);
+
+  // Fresh stamp for the affected-set marks, so nothing has to be cleared.
   state.generation++;
-  const { mark, affected, generation } = state;
-  let count = 0;
 
-  for (let i = 0; i < seedCount; i++) {
-    const seed = seeds[i];
-    let cursor = seed;
-    const cone = CONE_MIN + ((Math.imul(seed, 2654435761) >>> 0) % CONE_SPREAD);
-    for (let step = 0; step < cone; step++) {
-      // Cheap invertible scatter: dependents are spread across the population
-      // rather than sitting next to each other, as a real dependency graph would.
-      cursor = (cursor * 1103515245 + 12345 + step) >>> 0;
-      const row = cursor % rowCount;
-      if (mark[row] !== generation) {
-        mark[row] = generation;
-        affected[count++] = row;
-        if (count >= cascadeLimit) return -1;
-      }
-    }
-    if (mark[seed] !== generation) {
-      mark[seed] = generation;
-      affected[count++] = seed;
-    }
-  }
-  return count;
-}
-
-/** Recomputes the whole population, rebuilding baselines and the percentile distribution. */
-function recomputeAll(
-  results: Float64Array,
-  rowCount: number,
-  state: CalcState,
-  changedOut: Int32Array,
-): number {
-  const { baselines, composite } = state;
-
-  computeBaselines(results, rowCount, baselines);
-  for (let row = 0; row < rowCount; row++) {
-    composite[row] = computeComposite(results, row, baselines);
-  }
-  computeCompositeDistribution(composite, rowCount, baselines);
-
-  let changed = 0;
-  for (let row = 0; row < rowCount; row++) {
-    const dispersion = computeDispersion(results, row);
-    const percentile = percentileOf(composite[row], baselines);
-    if (writeRow(results, row, composite[row], dispersion, percentile)) {
-      changedOut[changed++] = row;
-    }
-  }
-  state.churn = 0;
-  return changed;
+  // No baselines yet, or the caller asked for everything: skip propagation.
+  const mustCascade = !state.baselines.valid || seedCount === 0;
+  run.cascaded = mustCascade;
+  run.phase = mustCascade ? PHASE_BASELINE : PHASE_PROPAGATE;
 }
 
 /**
- * Run the calculation.
+ * Run to completion in one call.
  *
- * The single entry point, and the only thing the engine is allowed to call.
- * Scope, cost and affected set are all outputs.
+ * The server path, and the one the synchronous runner uses. It delegates to the
+ * resumable machinery rather than duplicating it, so there is exactly one
+ * implementation of the arithmetic and the two schedules cannot drift apart.
  */
 export function calculate(
   results: Float64Array,
@@ -450,108 +484,216 @@ export function calculate(
   seeds: Int32Array,
   seedCount: number,
   state: CalcState,
+  run: CalcRun,
   changedOut: Int32Array,
 ): CalcResult {
-  // No baselines yet, or the caller asked for everything.
-  if (!state.baselines.valid || seedCount === 0) {
-    return { visited: rowCount, changed: recomputeAll(results, rowCount, state, changedOut), cascaded: true };
-  }
+  beginRun(run, state, seeds, seedCount);
+  advanceRun(results, rowCount, state, run, changedOut, Infinity);
+  return runResult(run);
+}
 
-  const affectedCount = propagate(state, seeds, seedCount, rowCount);
-  const churnLimit = rowCount * CHURN_LIMIT_FRACTION;
-
-  if (affectedCount < 0 || state.churn + affectedCount > churnLimit) {
-    return { visited: rowCount, changed: recomputeAll(results, rowCount, state, changedOut), cascaded: true };
-  }
-
-  const { baselines, affected } = state;
-  let changed = 0;
-  for (let i = 0; i < affectedCount; i++) {
-    const row = affected[i];
-    const composite = computeComposite(results, row, baselines);
-    const dispersion = computeDispersion(results, row);
-    const percentile = percentileOf(composite, baselines);
-    if (writeRow(results, row, composite, dispersion, percentile)) {
-      changedOut[changed++] = row;
-    }
-  }
-  state.churn += affectedCount;
-
-  return { visited: affectedCount, changed, cascaded: false };
+export function runResult(run: CalcRun): CalcResult {
+  return { visited: run.visited, changed: run.changedCount, cascaded: run.cascaded };
 }
 
 /**
- * The same calculation, yielding between chunks.
+ * Advances a run until `deadlineMs`, then returns.
  *
- * Whether the *real* calculation can offer this is the single most important
- * unknown for choosing a scheduling strategy — a black box that cannot be
- * interrupted rules out every main-thread option at once, leaving only "move it
- * to another thread". It is implemented here so that the option can be measured
- * rather than assumed.
+ * Returns `true` when the run is complete.
  *
- * Note what it still cannot do: yield *early with useful partial results for a
- * particular row*. The percentile phase needs every composite before any row's
- * final value is known, so the first two thirds of the work produce nothing
- * displayable. Interruptibility buys responsiveness, not earlier answers.
+ * Pass `Infinity` to run straight through with no yielding — that is the server
+ * path, and it costs one predictable-branch comparison per 256 rows against a
+ * straight-line implementation. Pass `performance.now() + 4` in the browser to
+ * get the same work spread across frames.
+ *
+ * Slicing by *time* rather than by row count is deliberate. A fixed 4,000-row
+ * chunk is ~4ms on a development machine and ~25ms on a low-end laptop, so a
+ * row-count budget silently stops working on exactly the hardware it was
+ * supposed to protect. A time budget self-calibrates.
  */
-export function* calculateChunked(
+export function advanceRun(
   results: Float64Array,
   rowCount: number,
-  seeds: Int32Array,
-  seedCount: number,
   state: CalcState,
+  run: CalcRun,
   changedOut: Int32Array,
-  chunkRows: number,
-): Generator<number, CalcResult> {
-  const affectedCount =
-    state.baselines.valid && seedCount > 0
-      ? propagate(state, seeds, seedCount, rowCount)
-      : -1;
+  deadlineMs: number,
+): boolean {
+  const { baselines, affected, composite, mark } = state;
+  const cascadeLimit = rowCount * CASCADE_FRACTION;
   const churnLimit = rowCount * CHURN_LIMIT_FRACTION;
-  const cascaded = affectedCount < 0 || state.churn + affectedCount > churnLimit;
 
-  const { baselines, composite, affected } = state;
-  let changed = 0;
+  while (run.phase !== PHASE_DONE) {
+    switch (run.phase) {
+      case PHASE_PROPAGATE: {
+        // Expand seeds into the affected set. Cascades if it gets too large.
+        while (run.cursor < run.seedCount) {
+          const seed = run.seeds[run.cursor++];
+          let cursor = seed;
+          const cone = CONE_MIN + ((Math.imul(seed, 2654435761) >>> 0) % CONE_SPREAD);
+          for (let step = 0; step < cone; step++) {
+            cursor = (cursor * 1103515245 + 12345 + step) >>> 0;
+            const row = cursor % rowCount;
+            if (mark[row] !== state.generation) {
+              mark[row] = state.generation;
+              affected[run.affectedCount++] = row;
+              if (run.affectedCount >= cascadeLimit) {
+                run.cascaded = true;
+                break;
+              }
+            }
+          }
+          if (run.cascaded) break;
+          if (mark[seed] !== state.generation) {
+            mark[seed] = state.generation;
+            affected[run.affectedCount++] = seed;
+          }
+          if (performance.now() >= deadlineMs) return false;
+        }
 
-  if (!cascaded) {
-    for (let start = 0; start < affectedCount; start += chunkRows) {
-      const end = Math.min(start + chunkRows, affectedCount);
-      for (let i = start; i < end; i++) {
-        const row = affected[i];
-        const c = computeComposite(results, row, baselines);
-        const d = computeDispersion(results, row);
-        const p = percentileOf(c, baselines);
-        if (writeRow(results, row, c, d, p)) changedOut[changed++] = row;
+        if (!run.cascaded && state.churn + run.affectedCount > churnLimit) {
+          run.cascaded = true;
+        }
+        run.phase = run.cascaded ? PHASE_BASELINE : PHASE_LOCAL;
+        run.cursor = 0;
+        break;
       }
-      yield end;
+
+      case PHASE_LOCAL: {
+        // The cheap path: recompute only the affected rows, against cached baselines.
+        let checked = 0;
+        while (run.cursor < run.affectedCount) {
+          const row = affected[run.cursor++];
+          const c = computeComposite(results, row, baselines);
+          const d = computeDispersion(results, row);
+          const p = percentileOf(c, baselines);
+          if (writeRow(results, row, c, d, p)) changedOut[run.changedCount++] = row;
+
+          if (++checked >= DEADLINE_CHECK_INTERVAL) {
+            checked = 0;
+            if (performance.now() >= deadlineMs) return false;
+          }
+        }
+        state.churn += run.affectedCount;
+        run.visited = run.affectedCount;
+        run.phase = PHASE_DONE;
+        break;
+      }
+
+      case PHASE_BASELINE: {
+        // Accumulate column sums. Sliced because at 6x CPU throttling a single
+        // pass over 450k reads is well past a frame on its own.
+        let checked = 0;
+        const { sum, sumSq } = run;
+        while (run.cursor < rowCount) {
+          const base = run.cursor++ * RESULT_SIZE;
+          for (let col = 0; col < INPUT_RESULT_COLUMNS; col++) {
+            const v = results[base + col];
+            sum[col] += v;
+            sumSq[col] += v * v;
+          }
+          if (++checked >= DEADLINE_CHECK_INTERVAL) {
+            checked = 0;
+            if (performance.now() >= deadlineMs) return false;
+          }
+        }
+        for (let col = 0; col < INPUT_RESULT_COLUMNS; col++) {
+          const mean = sum[col] / rowCount;
+          const variance = Math.max(sumSq[col] / rowCount - mean * mean, 1e-9);
+          baselines.mean[col] = mean;
+          baselines.invStd[col] = 1 / Math.sqrt(variance);
+        }
+        baselines.valid = true;
+        run.phase = PHASE_COMPOSITE;
+        run.cursor = 0;
+        break;
+      }
+
+      case PHASE_COMPOSITE: {
+        // The dominant phase: R10 for every row.
+        let checked = 0;
+        while (run.cursor < rowCount) {
+          composite[run.cursor] = computeComposite(results, run.cursor, baselines);
+          run.cursor++;
+          if (++checked >= DEADLINE_CHECK_INTERVAL) {
+            checked = 0;
+            if (performance.now() >= deadlineMs) return false;
+          }
+        }
+        run.phase = PHASE_RANGE;
+        run.cursor = 0;
+        break;
+      }
+
+      case PHASE_RANGE: {
+        let checked = 0;
+        let { min, max } = run;
+        while (run.cursor < rowCount) {
+          const c = composite[run.cursor++];
+          if (c < min) min = c;
+          if (c > max) max = c;
+          if (++checked >= DEADLINE_CHECK_INTERVAL) {
+            checked = 0;
+            run.min = min;
+            run.max = max;
+            if (performance.now() >= deadlineMs) return false;
+          }
+        }
+        run.min = min;
+        run.max = max;
+
+        const span = max - min;
+        baselines.compositeMin = min;
+        baselines.compositeScale = span > 0 ? (HISTOGRAM_BUCKETS - 1) / span : 0;
+        baselines.compositeCdf.fill(0);
+        run.phase = PHASE_HISTOGRAM;
+        run.cursor = 0;
+        break;
+      }
+
+      case PHASE_HISTOGRAM: {
+        let checked = 0;
+        const cdf = baselines.compositeCdf;
+        const { compositeMin, compositeScale } = baselines;
+        while (run.cursor < rowCount) {
+          cdf[((composite[run.cursor++] - compositeMin) * compositeScale) | 0]++;
+          if (++checked >= DEADLINE_CHECK_INTERVAL) {
+            checked = 0;
+            if (performance.now() >= deadlineMs) return false;
+          }
+        }
+        // Turn counts into a cumulative percentage. 2048 buckets: never worth slicing.
+        let running = 0;
+        const inv = 100 / rowCount;
+        for (let bucket = 0; bucket < HISTOGRAM_BUCKETS; bucket++) {
+          running += cdf[bucket];
+          cdf[bucket] = running * inv;
+        }
+        run.phase = PHASE_FINALISE;
+        run.cursor = 0;
+        break;
+      }
+
+      case PHASE_FINALISE: {
+        // Write R10/R11/R12 and record which rows actually moved.
+        let checked = 0;
+        while (run.cursor < rowCount) {
+          const row = run.cursor++;
+          const d = computeDispersion(results, row);
+          const p = percentileOf(composite[row], baselines);
+          if (writeRow(results, row, composite[row], d, p)) changedOut[run.changedCount++] = row;
+          if (++checked >= DEADLINE_CHECK_INTERVAL) {
+            checked = 0;
+            if (performance.now() >= deadlineMs) return false;
+          }
+        }
+        state.churn = 0;
+        run.visited = rowCount;
+        run.phase = PHASE_DONE;
+        break;
+      }
     }
-    state.churn += affectedCount;
-    return { visited: affectedCount, changed, cascaded: false };
   }
 
-  computeBaselines(results, rowCount, baselines);
-  yield 0;
-
-  for (let start = 0; start < rowCount; start += chunkRows) {
-    const end = Math.min(start + chunkRows, rowCount);
-    for (let row = start; row < end; row++) {
-      composite[row] = computeComposite(results, row, baselines);
-    }
-    yield end;
-  }
-
-  computeCompositeDistribution(composite, rowCount, baselines);
-
-  for (let start = 0; start < rowCount; start += chunkRows) {
-    const end = Math.min(start + chunkRows, rowCount);
-    for (let row = start; row < end; row++) {
-      const d = computeDispersion(results, row);
-      const p = percentileOf(composite[row], baselines);
-      if (writeRow(results, row, composite[row], d, p)) changedOut[changed++] = row;
-    }
-    yield rowCount + end;
-  }
-
-  state.churn = 0;
-  return { visited: rowCount, changed, cascaded: true };
+  return true;
 }
