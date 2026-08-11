@@ -1,0 +1,230 @@
+:root {
+  --bg: #0f1116;
+  --panel: #171a21;
+  --panel-2: #1e222b;
+  --border: #2a2f3a;
+  --text: #e6e8ec;
+  --muted: #9aa3b2;
+  --accent: #6ea8fe;
+  --good: #4ade80;
+  --bad: #f87171;
+
+  color-scheme: dark;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  background: var(--bg);
+  color: var(--text);
+  font-family: ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
+  font-size: 14px;
+}
+
+.app {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  height: 100%;
+  padding: 16px 20px 20px;
+}
+
+/* --- header --- */
+
+.app-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 24px;
+  flex-wrap: wrap;
+}
+
+.app-header h1 {
+  margin: 0;
+  font-size: 20px;
+  font-weight: 650;
+  letter-spacing: -0.01em;
+}
+
+.subtitle {
+  margin: 4px 0 0;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.hint {
+  margin: 0;
+  color: var(--muted);
+  font-size: 12.5px;
+}
+
+.hint strong {
+  color: var(--text);
+  font-weight: 600;
+}
+
+/* --- toolbar --- */
+
+.toolbar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+button {
+  font: inherit;
+  font-weight: 550;
+  color: #0b1020;
+  background: var(--accent);
+  border: 1px solid transparent;
+  border-radius: 7px;
+  padding: 7px 14px;
+  cursor: pointer;
+  transition: filter 0.12s ease;
+}
+
+button:hover {
+  filter: brightness(1.1);
+}
+
+button:active {
+  filter: brightness(0.95);
+}
+
+button.secondary {
+  background: var(--panel-2);
+  color: var(--text);
+  border-color: var(--border);
+}
+
+button.link {
+  background: none;
+  border: none;
+  color: var(--accent);
+  padding: 0 0 0 8px;
+  text-decoration: underline;
+  font-weight: 500;
+}
+
+.toolbar-status {
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.toolbar-status strong {
+  color: var(--text);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-weight: 600;
+}
+
+/* --- perf hud --- */
+
+.hud {
+  min-width: 330px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 10px 12px;
+}
+
+.hud-row {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+}
+
+.hud-label {
+  color: var(--muted);
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+
+.hud-value {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 16px;
+  font-weight: 650;
+  margin-left: auto;
+}
+
+.hud-value.good,
+.hud-bar-fill.good {
+  color: var(--good);
+}
+
+.hud-value.bad,
+.hud-bar-fill.bad {
+  color: var(--bad);
+}
+
+.hud-budget {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.hud-bar {
+  height: 5px;
+  margin: 8px 0;
+  background: var(--panel-2);
+  border-radius: 3px;
+  overflow: hidden;
+}
+
+.hud-bar-fill {
+  height: 100%;
+  background: currentColor;
+  border-radius: 3px;
+  transition: width 0.15s ease;
+}
+
+.hud-stats {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 6px 14px;
+  margin: 0;
+}
+
+.hud-stats dt {
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.hud-stats dd {
+  margin: 0;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12.5px;
+}
+
+/* --- grid --- */
+
+.grid-shell {
+  flex: 1;
+  min-height: 0;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  overflow: hidden;
+}
+
+/*
+ * The flash on a changed cell — the visible proof that a redux write reached
+ * the DOM. ag-grid adds `ag-cell-data-changed` on change and swaps it for
+ * `-animation` to fade out, so the colour goes on the first and the transition
+ * on the second.
+ */
+.ag-cell.ag-cell-data-changed {
+  background-color: rgba(110, 168, 254, 0.55) !important;
+}
+
+.ag-cell.ag-cell-data-changed-animation {
+  transition: background-color 0.45s ease-out;
+}
