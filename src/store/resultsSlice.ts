@@ -16,6 +16,22 @@ import { DATASET } from './dataset';
  * whole frame is 16.7ms and the grid still has to lay out and paint, so the
  * copy alone eats a quarter of the budget and gets worse as the dataset grows.
  *
+ * 
+ * 
+ * 
+ * 
+ * 
+ * 
+ * 
+ * 
+ * 
+ * 
+ * 
+ * 
+ * 
+ * 
+ * .
+ * 
  * Writing one double into a typed array is O(1) and allocates nothing, so an
  * edit costs the same at 50,000 rows as at 50. The tradeoff is that the value
  * buffer is not referentially immutable, so change detection keys off
